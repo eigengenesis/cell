@@ -799,9 +799,9 @@ def pearson_residual_rows(pred: np.ndarray, real: np.ndarray) -> float:
     return float(np.nanmean(vals)) if vals else float("nan")
 
 
-def build_eval_predictions(model, data: PreparedData, args, device):
+def build_eval_predictions(model, data: PreparedData, args, device, eval_seed: int | None = None):
     model.eval()
-    rng = np.random.default_rng(args.seed)
+    rng = np.random.default_rng(args.seed if eval_seed is None else eval_seed)
     control_idx = np.where(data.is_control)[0]
     gene_idx = select_eval_gene_indices(data, args)
     gene_names = [data.gene_names[i] for i in gene_idx]
@@ -962,7 +962,15 @@ def run_cell_eval(eval_data: dict, out_dir: Path, args, step: int):
 def evaluate(model, data: PreparedData, args, device, out_dir: Path | None = None, step: int = 0):
     was_training = model.training
     try:
-        eval_data = build_eval_predictions(model, data, args, device)
+        if args.eval_seed is None:
+            eval_data = build_eval_predictions(model, data, args, device)
+        else:
+            fork_devices = [device] if device.type == "cuda" else []
+            with torch.random.fork_rng(devices=fork_devices):
+                torch.manual_seed(args.eval_seed)
+                if device.type == "cuda":
+                    torch.cuda.manual_seed_all(args.eval_seed)
+                eval_data = build_eval_predictions(model, data, args, device, eval_seed=args.eval_seed)
         rows = eval_data["rows"]
         if not rows:
             return {}
@@ -1434,6 +1442,7 @@ def parse_args():
     p.add_argument("--ode-steps", type=int, default=20)
     p.add_argument("--eval-top-genes", type=int, default=1000)
     p.add_argument("--eval-cells", type=int, default=128)
+    p.add_argument("--eval-seed", type=int, default=None)
     p.add_argument("--eval-control-cells", type=int, default=0)
     p.add_argument("--eval-batch-size", type=int, default=64)
     p.add_argument("--eval-every", type=int, default=5000)
