@@ -308,7 +308,7 @@ def generate_sample(wrapped_vf, source, condition_vec=None, vf=None, gene_ids=No
         base_vf = vf.module if hasattr(vf, 'module') else vf
         null_pemb = base_vf.p_mask_embed.unsqueeze(0).expand(source.shape[0], -1).to(source.device)
 
-    def ode_fn(t, x):
+    def field(t, x):
         v_cond = wrapped_vf(x, t, source, condition_vec, vf, gene_ids, gene_all,
                             perturbation_gene_id=perturbation_gene_id)
         if cfg_scale > 0.0:
@@ -318,11 +318,20 @@ def generate_sample(wrapped_vf, source, condition_vec=None, vf=None, gene_ids=No
             return v_cond + cfg_scale * (v_cond - v_uncond)
         return v_cond
 
-    traj = torchdiffeq.odeint(
-        ode_fn, target_noise, torch.linspace(0, 1, steps).to(source.device),
-        atol=1e-4, rtol=1e-4, method=method,
-    )
-    out = source + traj[-1] if flow_target == 'delta' else traj[-1]
+    if is_void:
+        x = target_noise
+        dt = 1.0 / float(steps)
+        for i in range(steps):
+            t = torch.full((source.shape[0],), i / float(steps), device=source.device)
+            x = x + dt * field(t, x)
+        last = x
+    else:
+        last = torchdiffeq.odeint(
+            field, target_noise, torch.linspace(0, 1, steps).to(source.device),
+            atol=1e-4, rtol=1e-4, method=method,
+        )[-1]
+
+    out = source + last if flow_target == 'delta' else last
     return torch.clamp(out, min=0)
 
 
@@ -332,8 +341,6 @@ def test(data_sampler, vf, accelerator, batch_size=128, path='./', vocab=None, s
     is_void = config.fusion_method == 'void'
 
     if is_void:
-        # Geometry is fixed to the train panel. Rebuild the train-panel token order
-        # from panel_pos and project the validation cells onto exactly that panel.
         panel_size = len(panel_pos)
         pos_to_token = [0] * panel_size
         for tok, p in panel_pos.items():
@@ -347,7 +354,8 @@ def test(data_sampler, vf, accelerator, batch_size=128, path='./', vocab=None, s
 
         def to_panel(arr):
             t = arr if torch.is_tensor(arr) else torch.as_tensor(np.asarray(arr))
-            out = torch.zeros(t.shape[0], panel_size, dtype=t.dtype)
+            t = t.float()
+            out = torch.zeros(t.shape[0], panel_size, dtype=torch.float32)
             out[:, sel_valid] = t[:, sel[sel_valid]]
             return out
     else:
@@ -360,11 +368,22 @@ def test(data_sampler, vf, accelerator, batch_size=128, path='./', vocab=None, s
     perturbation_name_list = data_sampler._perturbation_covariates
     control_data = data_sampler.get_control_data()
     control_src = to_panel(control_data['src_cell_data'])
+
+    if is_void:
+        n_eval = min(config.infer_top_gene, control_src.shape[1])
+        cmean = control_src.float().mean(0)
+        eval_gene_idx = torch.argsort(cmean, descending=True)[:n_eval].sort().values.cpu().numpy()
+    else:
+        eval_gene_idx = None
+
+    def report(arr):
+        return arr[:, eval_gene_idx] if eval_gene_idx is not None else arr
+
     control_src_np = control_src.cpu().numpy() if torch.is_tensor(control_src) else np.asarray(control_src)
 
-    all_pred_expressions = [control_src_np]
+    all_pred_expressions = [report(control_src_np)]
     obs_perturbation_name_pred = ['control'] * control_src_np.shape[0]
-    all_target_expressions = [control_src_np]
+    all_target_expressions = [report(control_src_np)]
     obs_perturbation_name_real = ['control'] * control_src_np.shape[0]
 
     print('perturbation_name_list:', len(perturbation_name_list))
@@ -400,8 +419,8 @@ def test(data_sampler, vf, accelerator, batch_size=128, path='./', vocab=None, s
             pred_expressions.append(pred_expression)
 
         pred_expressions = torch.cat(pred_expressions, dim=0).cpu().numpy()
-        all_pred_expressions.append(pred_expressions)
-        all_target_expressions.append(target)
+        all_pred_expressions.append(report(pred_expressions))
+        all_target_expressions.append(report(target))
         obs_perturbation_name_pred.extend([perturbation_name] * pred_expressions.shape[0])
         obs_perturbation_name_real.extend([perturbation_name] * target.shape[0])
 
@@ -602,7 +621,7 @@ if __name__ == "__main__":
 
     vf = accelerator.prepare(vf)
     if is_void and config.devices == "1":
-        vf = torch.compile(vf, dynamic=False)
+        vf = torch.compile(vf, dynamic=True)
     optimizer, scheduler, dataloader = accelerator.prepare(optimizer, scheduler, dataloader)
     inverse_dict = {v: str(k) for k, v in data_manager.perturbation_dict.items()}
     pbar = tqdm.tqdm(total=config.steps, initial=start_iteration)
