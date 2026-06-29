@@ -1254,7 +1254,11 @@ def build_eval_predictions(model, data: PreparedData, args, device, eval_seed: i
         target = data.x[target_idx][:, gene_idx].astype(np.float32, copy=False)
         pred_mean = pred.mean(axis=0)
         target_mean = target.mean(axis=0)
-        delta_pred = pred_mean - control_mean
+        
+        src_all = data.x[src_idx][:, gene_idx].astype(np.float32, copy=False)
+        src_mean = src_all.mean(axis=0)
+        delta_pred = pred_mean - src_mean
+        
         delta_true = target_mean - control_mean
         top20_delta = np.argsort(np.abs(delta_true))[-min(20, len(delta_true)) :]
 
