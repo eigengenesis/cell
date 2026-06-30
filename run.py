@@ -3,59 +3,6 @@
 Standalone VOID Cell trainer.
 
 No scDFM imports and no gene tokenizer. Genes are direct AnnData column indices.
-%env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-%cd /content/protein
-!python void_cell/latest.py \
-  --dataset combosciplex \
-  --data-path data/combosciplex.h5ad \
-  --output-dir runs/combosciplex_ab_directional_residual_gate_hvg \
-  --steps 5000 \
-  --max-hours 5 \
-  --save-every 1000 \
-  --batch-size 64 \
-  --lr 5e-5 \
-  --optimizer muon \
-  --muon-lr 0.005 \
-  --warmup-steps 200 \
-  --grad-clip 0.5 \
-  --n-top-genes 3000 \
-  --infer-top-genes 1000 \
-  --store-dtype float16 \
-  --graph-cells 8192 \
-  --dim 192 \
-  --hidden 512 \
-  --encode-blocks 4 \
-  --think-steps 4 \
-  --graph-k 30 \
-  --manifold-dim 4 \
-  --directional-shifts \
-  --directional-residual-gate \
-  --directional-gate-init -4.0 \
-  --shift-dims 3 \
-  --shift-stencil cube \
-  --shift-temperature 4.0 \
-  --shift-code-strength 1.0 \
-  --neighbor-chunk 512 \
-  --flow-target delta \
-  --gamma 0.25 \
-  --recon-weight 0.5 \
-  --bulk-loss-weight 2.0 \
-  --hetero-weight 0.0 \
-  --delta-noise-scale 1.0 \
-  --eval-every 500 \
-  --eval-top-genes 1000 \
-  --eval-gene-selection hvg_test \
-  --eval-cells 128 \
-  --eval-seed 123 \
-  --eval-batch-size 16 \
-  --no-cell-eval \
-  --precision fp16 \
-  --log-every 25 \
-  --use-mmd \
-  --num-workers 2 \
-  --compile \
-  --compile-mode default
 """
 
 from __future__ import annotations
