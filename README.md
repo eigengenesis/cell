@@ -13,6 +13,16 @@ The current best path is:
 - Muon for hidden 2D matrices, AdamW for embeddings/norms/biases/output heads
 - CFM + MMD + reconstruction + bulk losses
 
+## Codebase Structure
+
+The codebase is split into 5 core modules:
+
+- `run.py`: The main entry point. Contains argument parsing, the training loop, and the custom optimizers (`HybridMuonAdamW`).
+- `model.py`: Contains the `VoidCellModel` architecture and the spectral coexpression geometry builders.
+- `blocks.py`: Houses the foundational PyTorch modules, layers (like `ValueEncoder`), and the `VoidGeneBlock` neighborhood message-passing layers.
+- `data.py`: Handles dataset parsing, PyTorch dataloaders, and splitting strategies for AnnData files.
+- `eval.py`: Holds all evaluation generation logic, distance metrics, distribution-matching metrics, and fast evaluation paths.
+
 ## Data Layout
 
 Put the downloaded datasets here:

@@ -13,11 +13,12 @@ there is no gene tokenizer and no NCE loss path.
 
 ## 2. Put Code and Data in Place
 
-Upload or clone the project so this path exists:
-
-```text
-/content/protein/cell/run.py
-```
+Upload or clone the project so these files exist in `/content/protein/cell`:
+- `run.py`: Entry point and training loop.
+- `model.py`: Model architecture.
+- `blocks.py`: Neural network layers.
+- `data.py`: Dataset logic.
+- `eval.py`: Evaluation metrics.
 
 Create the data folder:
 
