@@ -7,8 +7,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from pathlib import Path
 
-from layers import ValueEncoder, TimestepEmbedder
-from blocks import VoidGeneBlock, manifold_shift_anchors, manifold_shift_weights, fixed_shift_codes, auto_grid_shape, assign_genes_to_grid, shift_nd_nonwrap
+from blocks import ValueEncoder, TimestepEmbedder, VoidGeneBlock, manifold_shift_anchors, manifold_shift_weights, fixed_shift_codes, auto_grid_shape, assign_genes_to_grid, shift_nd_nonwrap
 
 def spectral_gene_coordinates(neighbors: np.ndarray, weights: np.ndarray, manifold_dim: int) -> np.ndarray:
     n_genes = int(neighbors.shape[0])
