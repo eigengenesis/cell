@@ -8,7 +8,7 @@ No scDFM imports and no gene tokenizer. Genes are direct AnnData column indices.
 from __future__ import annotations
 
 from data import COMBOSCIPLEX_DEFAULT_TEST, DEFAULT_CELL_EVAL_SKIP, seed_everything, PerturbationBatchDataset, prepare_norman, prepare_combosciplex
-from eval import evaluate, make_flow_noise, format_duration, write_metrics, metrics_log_line
+from eval import evaluate, make_flow_noise, format_duration, write_metrics, metrics_log_line, median_sigmas, mmd_multi_sigma
 
 import argparse
 import csv
