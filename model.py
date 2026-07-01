@@ -298,57 +298,60 @@ class VoidCellModel(nn.Module):
     def neighbor_messages(self, x):
         b, g, d = x.shape
         pos_csr, neg_csr, _, _ = self._get_sparse_mats(x.device)
-        xt = x.permute(1, 0, 2).reshape(g, b * d).float()
-        pos_msg = torch.sparse.mm(pos_csr, xt).reshape(g, b, d).permute(1, 0, 2)
-        neg_msg = torch.sparse.mm(neg_csr, xt).reshape(g, b, d).permute(1, 0, 2)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            xt = x.permute(1, 0, 2).reshape(g, b * d).float()
+            pos_msg = torch.sparse.mm(pos_csr, xt).reshape(g, b, d).permute(1, 0, 2)
+            neg_msg = torch.sparse.mm(neg_csr, xt).reshape(g, b, d).permute(1, 0, 2)
         return pos_msg.to(x.dtype), neg_msg.to(x.dtype)
 
     def directional_neighbor_messages(self, x):
         b, g, d = x.shape
         pos_csr, neg_csr, dir_pos_csrs, dir_neg_csrs = self._get_sparse_mats(x.device)
-        xt = x.permute(1, 0, 2).reshape(g, b * d).float()
-        shift_codes = self.shift_codes.to(device=x.device, dtype=torch.float32)
-        R = shift_codes.shape[0]
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            xt = x.permute(1, 0, 2).reshape(g, b * d).float()
+            shift_codes = self.shift_codes.to(device=x.device, dtype=torch.float32)
+            R = shift_codes.shape[0]
 
-        base_pos = torch.sparse.mm(pos_csr, xt).reshape(g, b, d)
-        base_neg = torch.sparse.mm(neg_csr, xt).reshape(g, b, d)
+            base_pos = torch.sparse.mm(pos_csr, xt).reshape(g, b, d)
+            base_neg = torch.sparse.mm(neg_csr, xt).reshape(g, b, d)
 
-        pos_delta = torch.zeros(g, b, d, device=x.device, dtype=torch.float32)
-        neg_delta = torch.zeros(g, b, d, device=x.device, dtype=torch.float32)
-        for r in range(R):
-            dp = torch.sparse.mm(dir_pos_csrs[r], xt).reshape(g, b, d)
-            dn = torch.sparse.mm(dir_neg_csrs[r], xt).reshape(g, b, d)
-            code = shift_codes[r]
-            pos_delta = pos_delta + dp * code[None, None, :]
-            neg_delta = neg_delta + dn * code[None, None, :]
+            pos_delta = torch.zeros(g, b, d, device=x.device, dtype=torch.float32)
+            neg_delta = torch.zeros(g, b, d, device=x.device, dtype=torch.float32)
+            for r in range(R):
+                dp = torch.sparse.mm(dir_pos_csrs[r], xt).reshape(g, b, d)
+                dn = torch.sparse.mm(dir_neg_csrs[r], xt).reshape(g, b, d)
+                code = shift_codes[r]
+                pos_delta = pos_delta + dp * code[None, None, :]
+                neg_delta = neg_delta + dn * code[None, None, :]
 
-        pos_msg = (base_pos + self.shift_code_strength * pos_delta).permute(1, 0, 2)
-        neg_msg = (base_neg + self.shift_code_strength * neg_delta).permute(1, 0, 2)
+            pos_msg = (base_pos + self.shift_code_strength * pos_delta).permute(1, 0, 2)
+            neg_msg = (base_neg + self.shift_code_strength * neg_delta).permute(1, 0, 2)
         return pos_msg.to(x.dtype), neg_msg.to(x.dtype)
 
     def directional_residual_neighbor_messages(self, x):
         b, g, d = x.shape
         pos_csr, neg_csr, dir_pos_csrs, dir_neg_csrs = self._get_sparse_mats(x.device)
-        xt = x.permute(1, 0, 2).reshape(g, b * d).float()
-        shift_codes = self.shift_codes.to(device=x.device, dtype=torch.float32)
-        gate = torch.sigmoid(self.directional_gate_logit).to(device=x.device, dtype=torch.float32)
-        R = shift_codes.shape[0]
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            xt = x.permute(1, 0, 2).reshape(g, b * d).float()
+            shift_codes = self.shift_codes.to(device=x.device, dtype=torch.float32)
+            gate = torch.sigmoid(self.directional_gate_logit).to(device=x.device, dtype=torch.float32)
+            R = shift_codes.shape[0]
 
-        base_pos = torch.sparse.mm(pos_csr, xt).reshape(g, b, d)
-        base_neg = torch.sparse.mm(neg_csr, xt).reshape(g, b, d)
+            base_pos = torch.sparse.mm(pos_csr, xt).reshape(g, b, d)
+            base_neg = torch.sparse.mm(neg_csr, xt).reshape(g, b, d)
 
-        pos_delta = torch.zeros(g, b, d, device=x.device, dtype=torch.float32)
-        neg_delta = torch.zeros(g, b, d, device=x.device, dtype=torch.float32)
-        for r in range(R):
-            dp = torch.sparse.mm(dir_pos_csrs[r], xt).reshape(g, b, d)
-            dn = torch.sparse.mm(dir_neg_csrs[r], xt).reshape(g, b, d)
-            code = shift_codes[r]
-            pos_delta = pos_delta + dp * code[None, None, :]
-            neg_delta = neg_delta + dn * code[None, None, :]
+            pos_delta = torch.zeros(g, b, d, device=x.device, dtype=torch.float32)
+            neg_delta = torch.zeros(g, b, d, device=x.device, dtype=torch.float32)
+            for r in range(R):
+                dp = torch.sparse.mm(dir_pos_csrs[r], xt).reshape(g, b, d)
+                dn = torch.sparse.mm(dir_neg_csrs[r], xt).reshape(g, b, d)
+                code = shift_codes[r]
+                pos_delta = pos_delta + dp * code[None, None, :]
+                neg_delta = neg_delta + dn * code[None, None, :]
 
-        scaled_gate = gate * self.shift_code_strength
-        pos_msg = (base_pos + scaled_gate * pos_delta).permute(1, 0, 2)
-        neg_msg = (base_neg + scaled_gate * neg_delta).permute(1, 0, 2)
+            scaled_gate = gate * self.shift_code_strength
+            pos_msg = (base_pos + scaled_gate * pos_delta).permute(1, 0, 2)
+            neg_msg = (base_neg + scaled_gate * neg_delta).permute(1, 0, 2)
         return pos_msg.to(x.dtype), neg_msg.to(x.dtype)
 
     def spatial_grid_message(self, x):
