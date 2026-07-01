@@ -43,9 +43,9 @@ def mmd_multi_sigma(x, y, sigmas):
         )
     return torch.stack(vals).mean()
 
-def make_flow_noise(source, args, eval_mode: bool = False):
+def make_flow_noise(source, args, eval_mode: bool = False, delta_noise_scale: float | None = None):
     if args.flow_target == "delta":
-        scale = args.delta_noise_scale
+        scale = args.delta_noise_scale if delta_noise_scale is None else delta_noise_scale
         if eval_mode and args.eval_delta_noise_scale is not None:
             scale = args.eval_delta_noise_scale
         return torch.randn_like(source) * float(scale)
@@ -60,9 +60,26 @@ def generate(model, source, pert, pert_gene, steps, args, device):
     pert_gene = pert_gene.to(device)
     x = make_flow_noise(source, args, eval_mode=True)
     dt = 1.0 / float(steps)
+    method = getattr(args, "ode_method", "euler")
     for i in range(steps):
         t = torch.full((source.size(0),), i / float(steps), device=device)
-        x = x + dt * model(x, source, t, pert, pert_gene)
+        if method == "euler":
+            x = x + dt * model(x, source, t, pert, pert_gene)
+        elif method == "heun":
+            k1 = model(x, source, t, pert, pert_gene)
+            t_next = torch.full((source.size(0),), (i + 1) / float(steps), device=device)
+            k2 = model(x + dt * k1, source, t_next, pert, pert_gene)
+            x = x + 0.5 * dt * (k1 + k2)
+        elif method == "rk4":
+            half_t = torch.full((source.size(0),), (i + 0.5) / float(steps), device=device)
+            next_t = torch.full((source.size(0),), (i + 1) / float(steps), device=device)
+            k1 = model(x, source, t, pert, pert_gene)
+            k2 = model(x + 0.5 * dt * k1, source, half_t, pert, pert_gene)
+            k3 = model(x + 0.5 * dt * k2, source, half_t, pert, pert_gene)
+            k4 = model(x + dt * k3, source, next_t, pert, pert_gene)
+            x = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        else:
+            raise ValueError(f"Unsupported ODE method: {method}")
     if args.flow_target == "delta":
         return (source + x).clamp_min(0)
     return x.clamp_min(0)
@@ -215,6 +232,8 @@ def build_eval_predictions(model, data: PreparedData, args, device, eval_seed: i
             "[eval] fast eval start | "
             f"conditions {len(eval_items)} | cells/condition {n_pred_preview} | "
             f"batch {args.eval_batch_size} | ode_steps {args.ode_steps} | "
+            f"ode_method {getattr(args, 'ode_method', 'euler')} | "
+            f"eval_delta_noise {getattr(args, 'eval_delta_noise_scale', None)} | "
             f"forwards/condition {n_batches_preview * args.ode_steps} | "
             f"genes {len(gene_idx)} {getattr(args, 'eval_gene_selection', 'mean')}",
             flush=True,
@@ -372,7 +391,7 @@ def run_cell_eval(eval_data: dict, out_dir: Path, args, step: int):
     )
     results, agg_results = evaluator.compute(
         profile=args.cell_eval_profile,
-        skip_metrics=parse_skip_metrics(args.cell_eval_skip_metrics),
+        skip_metrics=None if getattr(args, "official_eval_no_skip", False) else parse_skip_metrics(args.cell_eval_skip_metrics),
         write_csv=False,
     )
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -402,6 +421,12 @@ def evaluate(model, data: PreparedData, args, device, out_dir: Path | None = Non
         metrics = aggregate_metric_rows(rows, args)
         metrics["EvalGenes"] = eval_data.get("gene_count", float("nan"))
         metrics["EvalGeneSelection"] = eval_data.get("gene_selection", "")
+        metrics["EvalOdeMethod"] = getattr(args, "ode_method", "euler")
+        metrics["EvalOdeSteps"] = getattr(args, "ode_steps", float("nan"))
+        eval_noise = getattr(args, "eval_delta_noise_scale", None)
+        if eval_noise is None:
+            eval_noise = getattr(args, "delta_noise_scale", float("nan"))
+        metrics["EvalDeltaNoiseScale"] = eval_noise
         metrics["DE-Spearman"] = metrics.get("DE-Spearman_fast_top20", float("nan"))
         metrics["DS"] = float("nan")
         metrics["DM"] = float("nan")
@@ -431,6 +456,9 @@ def write_metrics(path: Path, metrics: dict):
         "Eval",
         "EvalGenes",
         "EvalGeneSelection",
+        "EvalOdeMethod",
+        "EvalOdeSteps",
+        "EvalDeltaNoiseScale",
         "L2",
         "MSE",
         "MAE",
@@ -454,6 +482,9 @@ def metrics_log_line(metrics: dict) -> str:
         f"step {metrics.get('Step', 'n/a')}",
         str(metrics.get("Eval", "fast")),
         f"Genes {metrics.get('EvalGenes', 'n/a')}",
+        f"GeneSel {metrics.get('EvalGeneSelection', 'n/a')}",
+        f"ODE {metrics.get('EvalOdeMethod', 'euler')}/{metrics.get('EvalOdeSteps', 'n/a')}",
+        f"EvalNoise {format_metric(metrics.get('EvalDeltaNoiseScale'))}",
         f"L2 {format_metric(metrics.get('L2'))}",
         f"MSE {format_metric(metrics.get('MSE'), 5)}",
         f"MAE {format_metric(metrics.get('MAE'), 5)}",
@@ -466,4 +497,3 @@ def metrics_log_line(metrics: dict) -> str:
         f"PearsonHat20 {format_metric(metrics.get('Pearson_Delta_Hat20'))}",
     ]
     return "[eval] " + " | ".join(parts)
-

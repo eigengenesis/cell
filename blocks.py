@@ -184,6 +184,7 @@ class VoidGeneBlock(nn.Module):
         self_weight: float = 1.0,
         neighbor_weight: float = 1.0,
         global_weight: float = 1.0,
+        source_weight: float = 1.0,
     ):
         super().__init__()
         self.residual_scale = float(residual_scale)
@@ -191,10 +192,12 @@ class VoidGeneBlock(nn.Module):
         self.self_weight = float(self_weight)
         self.neighbor_weight = float(neighbor_weight)
         self.global_weight = float(global_weight)
+        self.source_weight = float(source_weight)
         self.gene_norm = nn.LayerNorm(dim)
         self.global_norm = nn.LayerNorm(dim)
         self.ada = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
         self.self_contract = nn.Linear(dim, hidden, bias=False)
+        self.source_contract = nn.Linear(dim, hidden, bias=False)
         self.pos_neighbor_contract = nn.Linear(dim, hidden, bias=False)
         self.neg_neighbor_contract = nn.Linear(dim, hidden, bias=False)
         self.global_contract = nn.Linear(dim, hidden, bias=False)
@@ -216,11 +219,14 @@ class VoidGeneBlock(nn.Module):
         )
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x, global_state, pos_neighbor_mean, neg_neighbor_mean, condition):
+    def forward(self, x, global_state, pos_neighbor_mean, neg_neighbor_mean, condition, source_state=None):
         sx, ax, gx, sg, ag, gg = self.ada(condition).chunk(6, dim=-1)
         x_mod = self.gene_norm(x) * (1.0 + ax[:, None, :]) + sx[:, None, :]
         g_mod = self.global_norm(global_state) * (1.0 + ag) + sg
         mixed = self.self_weight * self.self_contract(x_mod)
+        if source_state is not None and self.source_weight != 0.0:
+            source_mod = self.gene_norm(source_state)
+            mixed = mixed + self.source_weight * self.source_contract(source_mod)
         pos_msg = self.pos_neighbor_contract(pos_neighbor_mean)
         neg_msg = self.neg_neighbor_contract(neg_neighbor_mean)
         if self.neighbor_gate is not None:
@@ -236,5 +242,4 @@ class VoidGeneBlock(nn.Module):
         dg = self.global_update(torch.cat([g_mod, pooled], dim=-1))
         global_state = global_state + self.residual_scale * torch.tanh(gg) * dg
         return x, global_state
-
 

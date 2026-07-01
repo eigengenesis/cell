@@ -133,6 +133,12 @@ class VoidCellModel(nn.Module):
         self_weight: float = 1.0,
         neighbor_weight: float = 1.0,
         global_weight: float = 1.0,
+        source_memory: str = "static",
+        source_weight: float = 1.0,
+        action_field: str = "target_gene",
+        action_strength: float = 1.0,
+        dynamic_edge_gate: bool = False,
+        edge_gate_init: float = 2.0,
         checkpoint_blocks: bool = False,
     ):
         super().__init__()
@@ -147,10 +153,23 @@ class VoidCellModel(nn.Module):
         self.spatial_shift_code_strength = float(spatial_shift_code_strength)
         self.graph_message_weight = float(graph_message_weight)
         self.spatial_message_weight = float(spatial_message_weight)
+        if source_memory not in {"none", "static"}:
+            raise ValueError(f"Unsupported source memory: {source_memory}")
+        if action_field not in {"none", "target_gene", "drug_manifold"}:
+            raise ValueError(f"Unsupported action field: {action_field}")
+        self.source_memory = source_memory
+        self.source_weight = float(source_weight)
+        self.action_field = action_field
+        self.action_strength = float(action_strength)
+        self.dynamic_edge_gate = bool(dynamic_edge_gate)
+        self.edge_gate_init = float(edge_gate_init)
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.register_buffer("neighbors", neighbors.long(), persistent=True)
         self.register_buffer("edge_weights", edge_weights.float(), persistent=True)
         self.register_buffer("manifold_coords", manifold_coords.float(), persistent=True)
+        self.manifold_dim = int(manifold_coords.shape[1])
+        if self.action_field == "drug_manifold" and self.manifold_dim <= 0:
+            raise ValueError("--action-field drug_manifold needs --manifold-dim >= 1")
         if self.directional_shifts:
             anchors = manifold_shift_anchors(manifold_coords.shape[1], shift_dims, shift_stencil)
             shift_weights = manifold_shift_weights(neighbors, manifold_coords, anchors, shift_temperature)
@@ -202,7 +221,32 @@ class VoidCellModel(nn.Module):
             nn.Linear(dim, dim),
             nn.LayerNorm(dim),
         )
+        self.source_fusion = nn.Sequential(
+            nn.Linear(3 * dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+        )
         self.condition_fusion = nn.Sequential(nn.Linear(3 * dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+        self.action_vector = nn.Linear(dim, dim)
+        self.action_projection = nn.Linear(dim, dim, bias=False)
+        nn.init.trunc_normal_(self.action_projection.weight, std=1e-4)
+        if self.manifold_dim > 0:
+            self.drug_to_manifold = nn.Linear(dim, self.manifold_dim)
+        else:
+            self.drug_to_manifold = None
+        self.action_log_temperature = nn.Parameter(torch.tensor(math.log(1.0)))
+        self.action_log_radius = nn.Parameter(torch.tensor(math.log(1.0)))
+        if self.dynamic_edge_gate:
+            self.edge_gate = nn.Sequential(
+                nn.Linear(4 * dim, hidden),
+                nn.SiLU(),
+                nn.Linear(hidden, 2),
+            )
+            nn.init.zeros_(self.edge_gate[-1].weight)
+            nn.init.constant_(self.edge_gate[-1].bias, self.edge_gate_init)
+        else:
+            self.edge_gate = None
         self.encode = nn.ModuleList(
             [
                 VoidGeneBlock(
@@ -214,6 +258,7 @@ class VoidCellModel(nn.Module):
                     self_weight=self_weight,
                     neighbor_weight=neighbor_weight,
                     global_weight=global_weight,
+                    source_weight=source_weight,
                 )
                 for _ in range(encode_blocks)
             ]
@@ -227,132 +272,102 @@ class VoidCellModel(nn.Module):
             self_weight=self_weight,
             neighbor_weight=neighbor_weight,
             global_weight=global_weight,
+            source_weight=source_weight,
         )
         self.ghost_gate_logit = nn.Parameter(torch.tensor(-2.1972))
         self.out_norm = nn.LayerNorm(dim)
         self.velocity = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(), nn.Linear(dim, 1))
-        self._precompute_sparse_neighbor_matrices()
-
-    def _precompute_sparse_neighbor_matrices(self):
-        """Precompute normalized sparse matrices for neighbor message passing.
-
-        Replaces the dense (B, G, K, D) gather with sparse matrix multiplication,
-        cutting memory by ~50x and removing the chunked Python loop.
-        Arithmetic is identical to the original gather-based implementation.
-        """
-        G, K = self.neighbors.shape
-        w = self.edge_weights
-        pos_w = w.clamp_min(0.0)
-        neg_w = (-w).clamp_min(0.0)
-        pos_den = pos_w.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        neg_den = neg_w.sum(dim=1, keepdim=True).clamp_min(1e-6)
-
-        rows = torch.arange(G).unsqueeze(1).expand(G, K).reshape(-1)
-        cols = self.neighbors.reshape(-1)
-        idx = torch.stack([rows, cols], dim=0)
-
-        self.register_buffer("_spmm_idx", idx, persistent=False)
-        self.register_buffer("_spmm_pos_val", (pos_w / pos_den).reshape(-1), persistent=False)
-        self.register_buffer("_spmm_neg_val", (neg_w / neg_den).reshape(-1), persistent=False)
-
-        if self.directional_shifts:
-            sw = self.shift_weights  # (G, K, R)
-            R = sw.shape[2]
-            # For each direction r, precompute the product of
-            # shift_weights[:,:,r] with the normalized pos/neg edge weights.
-            dir_pos = torch.stack([(sw[:, :, r] * pos_w / pos_den).reshape(-1) for r in range(R)])
-            dir_neg = torch.stack([(sw[:, :, r] * neg_w / neg_den).reshape(-1) for r in range(R)])
-            self.register_buffer("_spmm_dir_pos_vals", dir_pos, persistent=False)
-            self.register_buffer("_spmm_dir_neg_vals", dir_neg, persistent=False)
-
-        self._sparse_cache: dict = {}
-
-    @torch.compiler.disable
-    def _get_sparse_mats(self, device):
-        """Lazily build and cache CSR matrices on the target device."""
-        cached = self._sparse_cache.get(device)
-        if cached is not None:
-            return cached
-
-        G = self.n_genes
-        idx = self._spmm_idx
-        size = (G, G)
-
-        pos_csr = torch.sparse_coo_tensor(idx, self._spmm_pos_val, size).coalesce().to_sparse_csr()
-        neg_csr = torch.sparse_coo_tensor(idx, self._spmm_neg_val, size).coalesce().to_sparse_csr()
-
-        dir_pos_csrs: list = []
-        dir_neg_csrs: list = []
-        if self.directional_shifts and hasattr(self, "_spmm_dir_pos_vals"):
-            R = self._spmm_dir_pos_vals.shape[0]
-            for r in range(R):
-                dp = torch.sparse_coo_tensor(idx, self._spmm_dir_pos_vals[r], size).coalesce().to_sparse_csr()
-                dn = torch.sparse_coo_tensor(idx, self._spmm_dir_neg_vals[r], size).coalesce().to_sparse_csr()
-                dir_pos_csrs.append(dp)
-                dir_neg_csrs.append(dn)
-
-        cached = (pos_csr, neg_csr, dir_pos_csrs, dir_neg_csrs)
-        self._sparse_cache[device] = cached
-        return cached
 
     def neighbor_messages(self, x):
         b, g, d = x.shape
-        pos_csr, neg_csr, _, _ = self._get_sparse_mats(x.device)
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            xt = x.permute(1, 0, 2).reshape(g, b * d).float()
-            pos_msg = torch.sparse.mm(pos_csr, xt).reshape(g, b, d).permute(1, 0, 2)
-            neg_msg = torch.sparse.mm(neg_csr, xt).reshape(g, b, d).permute(1, 0, 2)
-        return pos_msg.to(x.dtype), neg_msg.to(x.dtype)
+        k = self.neighbors.size(1)
+        chunk = self.neighbor_chunk if self.neighbor_chunk > 0 else g
+        eps = 1e-6
+        if chunk >= g:
+            gathered = x.index_select(1, self.neighbors.reshape(-1)).reshape(b, g, k, d)
+            weights = self.edge_weights.to(device=x.device, dtype=x.dtype)
+            pos = weights.clamp_min(0.0)
+            neg = (-weights).clamp_min(0.0)
+            pos_msg = (gathered * pos[None, :, :, None]).sum(dim=2) / pos.sum(dim=1).clamp_min(eps)[None, :, None]
+            neg_msg = (gathered * neg[None, :, :, None]).sum(dim=2) / neg.sum(dim=1).clamp_min(eps)[None, :, None]
+            return pos_msg, neg_msg
+
+        pos_out = torch.empty_like(x)
+        neg_out = torch.empty_like(x)
+        weights = self.edge_weights.to(device=x.device, dtype=x.dtype)
+        for start in range(0, g, chunk):
+            end = min(start + chunk, g)
+            idx = self.neighbors[start:end].reshape(-1)
+            gathered = x.index_select(1, idx).reshape(b, end - start, k, d)
+            w = weights[start:end]
+            pos = w.clamp_min(0.0)
+            neg = (-w).clamp_min(0.0)
+            pos_out[:, start:end, :] = (gathered * pos[None, :, :, None]).sum(dim=2) / pos.sum(dim=1).clamp_min(eps)[None, :, None]
+            neg_out[:, start:end, :] = (gathered * neg[None, :, :, None]).sum(dim=2) / neg.sum(dim=1).clamp_min(eps)[None, :, None]
+        return pos_out, neg_out
 
     def directional_neighbor_messages(self, x):
         b, g, d = x.shape
-        pos_csr, neg_csr, dir_pos_csrs, dir_neg_csrs = self._get_sparse_mats(x.device)
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            xt = x.permute(1, 0, 2).reshape(g, b * d).float()
-            shift_codes = self.shift_codes.to(device=x.device, dtype=torch.float32)
-            R = shift_codes.shape[0]
-
-            base_pos = torch.sparse.mm(pos_csr, xt).reshape(g, b, d)
-            base_neg = torch.sparse.mm(neg_csr, xt).reshape(g, b, d)
-
-            pos_delta = torch.zeros(g, b, d, device=x.device, dtype=torch.float32)
-            neg_delta = torch.zeros(g, b, d, device=x.device, dtype=torch.float32)
-            for r in range(R):
-                dp = torch.sparse.mm(dir_pos_csrs[r], xt).reshape(g, b, d)
-                dn = torch.sparse.mm(dir_neg_csrs[r], xt).reshape(g, b, d)
-                code = shift_codes[r]
-                pos_delta = pos_delta + dp * code[None, None, :]
-                neg_delta = neg_delta + dn * code[None, None, :]
-
-            pos_msg = (base_pos + self.shift_code_strength * pos_delta).permute(1, 0, 2)
-            neg_msg = (base_neg + self.shift_code_strength * neg_delta).permute(1, 0, 2)
-        return pos_msg.to(x.dtype), neg_msg.to(x.dtype)
+        k = self.neighbors.size(1)
+        chunk = self.neighbor_chunk if self.neighbor_chunk > 0 else g
+        eps = 1e-6
+        pos_out = torch.zeros_like(x)
+        neg_out = torch.zeros_like(pos_out)
+        weights = self.edge_weights.to(device=x.device, dtype=x.dtype)
+        shift_weights = self.shift_weights.to(device=x.device, dtype=x.dtype)
+        shift_codes = self.shift_codes.to(device=x.device, dtype=x.dtype)
+        for start in range(0, g, chunk):
+            end = min(start + chunk, g)
+            idx = self.neighbors[start:end].reshape(-1)
+            gathered = x.index_select(1, idx).reshape(b, end - start, k, d)
+            edge = weights[start:end]
+            pos_base = edge.clamp_min(0.0)
+            neg_base = (-edge).clamp_min(0.0)
+            pos_den = pos_base.sum(dim=1).clamp_min(eps)[None, :, None]
+            neg_den = neg_base.sum(dim=1).clamp_min(eps)[None, :, None]
+            base_pos = (gathered * pos_base[None, :, :, None]).sum(dim=2) / pos_den
+            base_neg = (gathered * neg_base[None, :, :, None]).sum(dim=2) / neg_den
+            edge_codes = torch.einsum("gkr,rd->gkd", shift_weights[start:end], shift_codes)
+            directional = gathered * edge_codes[None]
+            pos_delta = (directional * pos_base[None, :, :, None]).sum(dim=2) / pos_den
+            neg_delta = (directional * neg_base[None, :, :, None]).sum(dim=2) / neg_den
+            pos_out[:, start:end, :] = base_pos + self.shift_code_strength * pos_delta
+            neg_out[:, start:end, :] = base_neg + self.shift_code_strength * neg_delta
+        return pos_out, neg_out
 
     def directional_residual_neighbor_messages(self, x):
         b, g, d = x.shape
-        pos_csr, neg_csr, dir_pos_csrs, dir_neg_csrs = self._get_sparse_mats(x.device)
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            xt = x.permute(1, 0, 2).reshape(g, b * d).float()
-            shift_codes = self.shift_codes.to(device=x.device, dtype=torch.float32)
-            gate = torch.sigmoid(self.directional_gate_logit).to(device=x.device, dtype=torch.float32)
-            R = shift_codes.shape[0]
+        k = self.neighbors.size(1)
+        chunk = self.neighbor_chunk if self.neighbor_chunk > 0 else g
+        eps = 1e-6
+        pos_out = torch.empty_like(x)
+        neg_out = torch.empty_like(x)
+        weights = self.edge_weights.to(device=x.device, dtype=x.dtype)
+        shift_weights = self.shift_weights.to(device=x.device, dtype=x.dtype)
+        shift_codes = self.shift_codes.to(device=x.device, dtype=x.dtype)
+        gate = torch.sigmoid(self.directional_gate_logit).to(device=x.device, dtype=x.dtype)
+        for start in range(0, g, chunk):
+            end = min(start + chunk, g)
+            idx = self.neighbors[start:end].reshape(-1)
+            gathered = x.index_select(1, idx).reshape(b, end - start, k, d)
+            edge = weights[start:end]
+            pos = edge.clamp_min(0.0)
+            neg = (-edge).clamp_min(0.0)
+            pos_den = pos.sum(dim=1).clamp_min(eps)[None, :, None]
+            neg_den = neg.sum(dim=1).clamp_min(eps)[None, :, None]
 
-            base_pos = torch.sparse.mm(pos_csr, xt).reshape(g, b, d)
-            base_neg = torch.sparse.mm(neg_csr, xt).reshape(g, b, d)
+            base_pos = (gathered * pos[None, :, :, None]).sum(dim=2) / pos_den
+            base_neg = (gathered * neg[None, :, :, None]).sum(dim=2) / neg_den
 
-            pos_delta = torch.zeros(g, b, d, device=x.device, dtype=torch.float32)
-            neg_delta = torch.zeros(g, b, d, device=x.device, dtype=torch.float32)
-            for r in range(R):
-                dp = torch.sparse.mm(dir_pos_csrs[r], xt).reshape(g, b, d)
-                dn = torch.sparse.mm(dir_neg_csrs[r], xt).reshape(g, b, d)
-                code = shift_codes[r]
-                pos_delta = pos_delta + dp * code[None, None, :]
-                neg_delta = neg_delta + dn * code[None, None, :]
+            edge_codes = torch.einsum("gkr,rd->gkd", shift_weights[start:end], shift_codes)
+            directional = gathered * edge_codes[None]
+            pos_delta = (directional * pos[None, :, :, None]).sum(dim=2) / pos_den
+            neg_delta = (directional * neg[None, :, :, None]).sum(dim=2) / neg_den
 
             scaled_gate = gate * self.shift_code_strength
-            pos_msg = (base_pos + scaled_gate * pos_delta).permute(1, 0, 2)
-            neg_msg = (base_neg + scaled_gate * neg_delta).permute(1, 0, 2)
-        return pos_msg.to(x.dtype), neg_msg.to(x.dtype)
+            pos_out[:, start:end, :] = base_pos + scaled_gate * pos_delta
+            neg_out[:, start:end, :] = base_neg + scaled_gate * neg_delta
+        return pos_out, neg_out
 
     def spatial_grid_message(self, x):
         b, g, d = x.shape
@@ -377,7 +392,72 @@ class VoidCellModel(nn.Module):
         pert_gene = self.pert_gene_embedding(gene_ids).mean(dim=1)
         return self.condition_fusion(torch.cat([time, pert, pert_gene], dim=-1)), pert
 
-    def run_block(self, block, x, global_state, cond):
+    def build_source_state(self, gene, coord, control):
+        if self.source_memory == "none" or self.source_weight == 0.0:
+            return None
+        return self.source_fusion(torch.cat([gene, coord, self.value_control(control)], dim=-1))
+
+    def target_gene_action_gate(self, perturbation_gene_id, b: int, g: int, device, dtype):
+        gate = torch.zeros((b, g), device=device, dtype=dtype)
+        gene_ids = perturbation_gene_id.long()
+        valid = (gene_ids >= 0) & (gene_ids < g)
+        if valid.any():
+            scatter_ids = gene_ids.clamp(0, max(g - 1, 0))
+            gate.scatter_add_(1, scatter_ids, valid.to(dtype))
+            gate.clamp_(0.0, 1.0)
+        return gate
+
+    def drug_manifold_action_gate(self, pert, device, dtype):
+        if self.drug_to_manifold is None or self.manifold_dim <= 0:
+            raise ValueError("--action-field drug_manifold needs --manifold-dim >= 1")
+        coords = self.manifold_coords.to(device=device, dtype=dtype)
+        drug_coord = self.drug_to_manifold(pert).to(dtype=dtype)
+        dist_sq = (drug_coord[:, None, :] - coords[None, :, :]).square().sum(dim=-1)
+        temperature = F.softplus(self.action_log_temperature).to(device=device, dtype=dtype).clamp_min(1e-4)
+        radius = F.softplus(self.action_log_radius).to(device=device, dtype=dtype).clamp_min(1e-4)
+        return torch.sigmoid(temperature * (radius - dist_sq))
+
+    def build_action_field(self, pert, perturbation_gene_id, b: int, g: int, device, dtype):
+        if self.action_field == "none" or self.action_strength == 0.0:
+            empty = torch.zeros((b, g, self.dim), device=device, dtype=dtype)
+            return empty, empty.mean(dim=1), None
+
+        action_vec = self.action_vector(pert).to(dtype=dtype)
+        if self.action_field == "target_gene":
+            gate = self.target_gene_action_gate(perturbation_gene_id, b, g, device, dtype)
+        elif self.action_field == "drug_manifold":
+            gate = self.drug_manifold_action_gate(pert, device, dtype)
+        else:
+            raise ValueError(f"Unsupported action field: {self.action_field}")
+
+        action = gate[:, :, None] * action_vec[:, None, :]
+        return action, action.mean(dim=1), gate
+
+    def action_auxiliary_loss(self, perturbation_id, perturbation_gene_id):
+        if self.action_field != "drug_manifold":
+            param = self.action_projection.weight
+            return param.new_tensor(0.0)
+        pert = self.perturbation_embedding(perturbation_id.clamp_min(0)).mean(dim=1)
+        gate = self.drug_manifold_action_gate(pert, pert.device, pert.dtype)
+        return gate.square().mean()
+
+    def apply_dynamic_edge_gate(self, x, global_state, cond, pos_msg, neg_msg, action_summary):
+        if self.edge_gate is None:
+            return pos_msg, neg_msg
+        b, g, _ = x.shape
+        if action_summary is None:
+            action_summary = torch.zeros_like(global_state)
+        global_field = global_state[:, None, :].expand(b, g, -1)
+        cond_field = cond[:, None, :].expand(b, g, -1)
+        action_field = action_summary[:, None, :].expand(b, g, -1)
+        gate_logits = self.edge_gate(torch.cat([x, global_field, cond_field, action_field], dim=-1))
+        baseline = torch.sigmoid(
+            torch.tensor(self.edge_gate_init, device=x.device, dtype=x.dtype)
+        ).clamp_min(1e-4)
+        gates = torch.sigmoid(gate_logits).to(dtype=x.dtype) / baseline
+        return pos_msg * gates[..., 0:1], neg_msg * gates[..., 1:2]
+
+    def run_block(self, block, x, global_state, cond, source_state=None, action_summary=None):
         if self.spatial_grid_shifts:
             spatial_msg = self.spatial_grid_message(x)
             if self.graph_message_weight == 0.0:
@@ -392,25 +472,33 @@ class VoidCellModel(nn.Module):
                     pos_msg, neg_msg = self.neighbor_messages(x)
                 pos_msg = self.graph_message_weight * pos_msg + self.spatial_message_weight * spatial_msg
                 neg_msg = self.graph_message_weight * neg_msg
-            return block(x, global_state, pos_msg, neg_msg, cond)
+            pos_msg, neg_msg = self.apply_dynamic_edge_gate(
+                x, global_state, cond, pos_msg, neg_msg, action_summary
+            )
+            return block(x, global_state, pos_msg, neg_msg, cond, source_state)
         if self.directional_shifts and self.directional_residual_gate:
             pos_msg, neg_msg = self.directional_residual_neighbor_messages(x)
         elif self.directional_shifts:
             pos_msg, neg_msg = self.directional_neighbor_messages(x)
         else:
             pos_msg, neg_msg = self.neighbor_messages(x)
-        return block(x, global_state, pos_msg, neg_msg, cond)
+        pos_msg, neg_msg = self.apply_dynamic_edge_gate(
+            x, global_state, cond, pos_msg, neg_msg, action_summary
+        )
+        return block(x, global_state, pos_msg, neg_msg, cond, source_state)
 
-    def maybe_checkpoint_block(self, block, x, global_state, cond):
+    def maybe_checkpoint_block(self, block, x, global_state, cond, source_state=None, action_summary=None):
         if self.training and self.checkpoint_blocks:
             return checkpoint(
-                lambda a, b, c: self.run_block(block, a, b, c),
+                lambda a, b, c, d, e: self.run_block(block, a, b, c, d, e),
                 x,
                 global_state,
                 cond,
+                source_state,
+                action_summary,
                 use_reentrant=False,
             )
-        return self.run_block(block, x, global_state, cond)
+        return self.run_block(block, x, global_state, cond, source_state, action_summary)
 
     def forward(self, x_t, control, t, perturbation_id, perturbation_gene_id):
         b, g = x_t.shape
@@ -420,12 +508,25 @@ class VoidCellModel(nn.Module):
         if coords.size(1) == 0:
             coords = torch.zeros(g, 1, device=x_t.device, dtype=x_t.dtype)
         coord = self.coord_embedding(coords)[None].expand(b, -1, -1)
-        x = self.input_fusion(torch.cat([gene, coord, self.value_current(x_t), self.value_control(control)], dim=-1))
-        global_state = x.mean(dim=1)
         cond, pert = self.condition(t, perturbation_id, perturbation_gene_id)
+        source_state = self.build_source_state(gene, coord, control)
+        x = self.input_fusion(torch.cat([gene, coord, self.value_current(x_t), self.value_control(control)], dim=-1))
+        action, action_summary, _ = self.build_action_field(
+            pert,
+            perturbation_gene_id,
+            b,
+            g,
+            x_t.device,
+            x.dtype,
+        )
+        if self.action_field != "none" and self.action_strength != 0.0:
+            x = x + self.action_strength * self.action_projection(action)
+        global_state = x.mean(dim=1)
 
         for block in self.encode:
-            x, global_state = self.maybe_checkpoint_block(block, x, global_state, cond)
+            x, global_state = self.maybe_checkpoint_block(
+                block, x, global_state, cond, source_state, action_summary
+            )
 
         x_init = x
         global_init = global_state
@@ -433,7 +534,12 @@ class VoidCellModel(nn.Module):
         for _ in range(self.think_steps):
             ghost_x = x + x_init
             cand_x, cand_global = self.maybe_checkpoint_block(
-                self.ghost, ghost_x, global_state + global_init, cond
+                self.ghost,
+                ghost_x,
+                global_state + global_init,
+                cond,
+                source_state,
+                action_summary,
             )
             x = x + gate * (cand_x - x)
             global_state = global_state + gate * (cand_global - global_state)
@@ -441,5 +547,3 @@ class VoidCellModel(nn.Module):
         x = self.out_norm(x)
         pert_field = pert[:, None, :].expand(-1, g, -1)
         return self.velocity(torch.cat([x, pert_field], dim=-1)).squeeze(-1)
-
-

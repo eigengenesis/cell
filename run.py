@@ -8,7 +8,15 @@ No scDFM imports and no gene tokenizer. Genes are direct AnnData column indices.
 from __future__ import annotations
 
 from data import COMBOSCIPLEX_DEFAULT_TEST, DEFAULT_CELL_EVAL_SKIP, seed_everything, PerturbationBatchDataset, prepare_norman, prepare_combosciplex
-from eval import evaluate, make_flow_noise, format_duration, write_metrics, metrics_log_line, median_sigmas, mmd_multi_sigma
+from eval import (
+    evaluate,
+    make_flow_noise,
+    format_duration,
+    write_metrics,
+    metrics_log_line,
+    median_sigmas,
+    mmd_multi_sigma,
+)
 
 import argparse
 import csv
@@ -69,7 +77,17 @@ from torch.utils.data import DataLoader, Dataset
 
 
 
-def train_step(model, batch, args, device):
+def delta_noise_scale_for_step(step: int, args) -> float:
+    end = float(args.delta_noise_end)
+    warmup = max(int(args.delta_noise_warmup), 0)
+    if warmup <= 0:
+        return end
+    progress = min(max(float(step) / float(warmup), 0.0), 1.0)
+    blend = 0.5 - 0.5 * math.cos(math.pi * progress)
+    return float(args.delta_noise_start) + (end - float(args.delta_noise_start)) * blend
+
+
+def train_step(model, batch, args, device, step: int = 0):
     source = batch["source"].to(device=device, dtype=torch.float32)
     target = batch["target"].to(device=device, dtype=torch.float32)
     pert = batch["perturbation_id"].to(device)
@@ -78,7 +96,8 @@ def train_step(model, batch, args, device):
     sample_genes = torch.randperm(g, device=device)[: args.infer_top_genes]
     t = torch.rand(b, device=device)
     target_state = target - source if args.flow_target == "delta" else target
-    noise = make_flow_noise(source, args)
+    noise_scale = delta_noise_scale_for_step(step, args) if args.flow_target == "delta" else None
+    noise = make_flow_noise(source, args, delta_noise_scale=noise_scale)
     x_t = (1.0 - t[:, None]) * noise + t[:, None] * target_state
     dx = target_state - noise
     pred = model(x_t, source, t, pert, pert_gene)
@@ -119,6 +138,12 @@ def train_step(model, batch, args, device):
         loss = loss + args.recon_weight * rec_loss
     if args.bulk_loss_weight > 0:
         loss = loss + args.bulk_loss_weight * bulk_loss
+    if args.action_aux_weight > 0:
+        base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+        action_aux = base_model.action_auxiliary_loss(pert, pert_gene)
+        loss = loss + args.action_aux_weight * action_aux
+    else:
+        action_aux = loss.new_tensor(0.0)
     if args.use_mmd:
         sigmas = median_sigmas(target[:, sample_genes])
         mmd = mmd_multi_sigma(x1_hat[:, sample_genes], target[:, sample_genes], sigmas)
@@ -129,9 +154,11 @@ def train_step(model, batch, args, device):
         "flow": float(flow_loss.detach().item()),
         "dir": float(dir_loss.detach().item()),
         "hetero": float(hetero_loss.detach().item()),
+        "action_aux": float(action_aux.detach().item()),
         "rec": float(rec_loss.detach().item()),
         "bulk": float(bulk_loss.detach().item()),
         "mmd": float(mmd.detach().item()),
+        "noise": float(noise_scale) if noise_scale is not None else float("nan"),
     }
     return loss, parts
 
@@ -198,10 +225,13 @@ def train_log_line(step: int, loss_value: float, elapsed: float, args, optimizer
                 f"flow {loss_parts.get('flow', 0.0):.4f}",
                 f"dir {loss_parts.get('dir', 0.0):.4f}",
                 f"het {loss_parts.get('hetero', 0.0):.4f}",
+                f"act {loss_parts.get('action_aux', 0.0):.4f}",
                 f"rec {loss_parts.get('rec', 0.0):.4f}",
                 f"bulk {loss_parts.get('bulk', 0.0):.4f}",
             ]
         )
+        if math.isfinite(loss_parts.get("noise", float("nan"))):
+            parts.append(f"noise {loss_parts.get('noise', 0.0):.3f}")
         if args.use_mmd:
             parts.append(f"mmd {loss_parts.get('mmd', 0.0):.4f}")
     if args.max_hours > 0:
@@ -283,6 +313,12 @@ def train(args):
         self_weight=args.self_weight,
         neighbor_weight=args.neighbor_weight,
         global_weight=args.global_weight,
+        source_memory=args.source_memory,
+        source_weight=args.source_weight,
+        action_field=args.action_field,
+        action_strength=args.action_strength,
+        dynamic_edge_gate=args.dynamic_edge_gate,
+        edge_gate_init=args.edge_gate_init,
         checkpoint_blocks=args.checkpoint_blocks,
     ).to(device)
     eval_model = model
@@ -297,6 +333,12 @@ def train(args):
     if getattr(base_model, "directional_residual_gate", False):
         gate = torch.sigmoid(base_model.directional_gate_logit.detach()).cpu().item()
         extra += f" directional_gate={gate:.4f}"
+    extra += (
+        f" source_memory={getattr(base_model, 'source_memory', 'none')}"
+        f" action_field={getattr(base_model, 'action_field', 'none')}"
+    )
+    if getattr(base_model, "dynamic_edge_gate", False):
+        extra += " dynamic_edge_gate=on"
     print(
         f"genes={data.x.shape[1]} perturbations={len(data.perturbation_names)} "
         f"params={sum(p.numel() for p in model.parameters())}{extra}"
@@ -327,7 +369,7 @@ def train(args):
             batch = {k: v.squeeze(0) for k, v in batch.items()}
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                loss, loss_parts = train_step(model, batch, args, device)
+                loss, loss_parts = train_step(model, batch, args, device, step)
             if scaler.is_enabled():
                 old_scale = scaler.get_scale()
                 scaler.scale(loss).backward()
@@ -620,21 +662,32 @@ def parse_args():
     p.add_argument("--self-weight", type=float, default=1.0)
     p.add_argument("--neighbor-weight", type=float, default=1.0)
     p.add_argument("--global-weight", type=float, default=1.0)
+    p.add_argument("--source-memory", choices=["none", "static"], default="static")
+    p.add_argument("--source-weight", type=float, default=1.0)
+    p.add_argument("--action-field", choices=["none", "target_gene", "drug_manifold"], default="target_gene")
+    p.add_argument("--action-strength", type=float, default=1.0)
+    p.add_argument("--dynamic-edge-gate", action="store_true")
+    p.add_argument("--edge-gate-init", type=float, default=2.0)
     p.add_argument("--checkpoint-blocks", action="store_true")
     p.add_argument("--dropout", type=float, default=0.05)
     p.add_argument("--residual-scale", type=float, default=0.1)
     p.add_argument("--noise", choices=["gaussian", "poisson"], default="gaussian")
     p.add_argument("--flow-target", choices=["cell", "delta"], default="cell")
     p.add_argument("--delta-noise-scale", type=float, default=1.0)
+    p.add_argument("--delta-noise-start", type=float, default=0.25)
+    p.add_argument("--delta-noise-end", type=float, default=1.0)
+    p.add_argument("--delta-noise-warmup", type=int, default=2000)
     p.add_argument("--eval-delta-noise-scale", type=float, default=None)
     p.add_argument("--use-mmd", action="store_true")
     p.add_argument("--gamma", type=float, default=0.5)
     p.add_argument("--dir-weight", type=float, default=0.0)
     p.add_argument("--hetero-weight", type=float, default=0.0)
+    p.add_argument("--action-aux-weight", type=float, default=0.01)
     p.add_argument("--recon-weight", type=float, default=0.5)
     p.add_argument("--bulk-loss-weight", type=float, default=2.0)
     p.add_argument("--mixed-condition-batch", action="store_true")
     p.add_argument("--ode-steps", type=int, default=20)
+    p.add_argument("--ode-method", choices=["euler", "heun", "rk4"], default="euler")
     p.add_argument("--eval-top-genes", type=int, default=1000)
     p.add_argument("--eval-gene-selection", choices=["mean", "hvg_test", "hvg_train"], default="mean")
     p.add_argument("--eval-cells", type=int, default=128)
@@ -650,6 +703,7 @@ def parse_args():
     p.add_argument("--cell-eval-batch-size", type=int, default=100)
     p.add_argument("--cell-eval-profile", choices=["full", "minimal", "de", "anndata", "vcc"], default="full")
     p.add_argument("--cell-eval-skip-metrics", default=DEFAULT_CELL_EVAL_SKIP)
+    p.add_argument("--official-eval-no-skip", action="store_true")
     p.add_argument("--save-eval-anndata", action="store_true")
     p.add_argument("--save-every", type=int, default=5000)
     p.add_argument("--max-hours", type=float, default=0.0)
