@@ -267,6 +267,7 @@ class VoidCellModel(nn.Module):
 
         self._sparse_cache: dict = {}
 
+    @torch.compiler.disable
     def _get_sparse_mats(self, device):
         """Lazily build and cache CSR matrices on the target device."""
         cached = self._sparse_cache.get(device)
