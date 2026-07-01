@@ -93,37 +93,23 @@ files manually from the same folder and upload them to `/content/protein/cell/da
   --graph-k 30 \
   --manifold-dim 4 \
   --neighbor-chunk 128 \
-  --checkpoint-blocks \
-  --recon-weight 0.5 \
-  --bulk-loss-weight 2.0 \
-  --eval-every 5000 \
-  --eval-top-genes 1000 \
-  --eval-cells 128 \
-  --eval-batch-size 64 \
-  --cell-eval-threads 2 \
-  --use-mmd
-```
+## 3. Run the Model
 
-## 5. ComboSciPlex Run
+Run the training script (this uses the recommended stable recipe):
 
-```python
+```bash
 %env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-%cd /content/protein/cell
 
 !python run.py \
   --dataset combosciplex \
   --data-path data/combosciplex.h5ad \
-  --output-dir runs/combosciplex_ab_directional_residual_gate_hvg \
-  --steps 5000 \
-  --max-hours 5 \
-  --save-every 1000 \
+  --output-dir runs/combosciplex_void_world_upgrade \
+  --steps 2000 \
   --batch-size 64 \
   --lr 5e-5 \
   --optimizer muon \
   --muon-lr 0.005 \
   --warmup-steps 200 \
-  --grad-clip 0.5 \
   --n-top-genes 3000 \
   --infer-top-genes 1000 \
   --store-dtype float16 \
@@ -134,33 +120,29 @@ files manually from the same folder and upload them to `/content/protein/cell/da
   --think-steps 4 \
   --graph-k 30 \
   --manifold-dim 4 \
-  --directional-shifts \
-  --directional-residual-gate \
-  --directional-gate-init -4.0 \
-  --shift-dims 3 \
-  --shift-stencil cube \
-  --shift-temperature 4.0 \
-  --shift-code-strength 1.0 \
-  --neighbor-chunk 512 \
+  --source-memory static \
+  --action-field drug_manifold \
+  --dynamic-edge-gate \
   --flow-target delta \
+  --delta-noise-start 0.25 \
+  --delta-noise-end 1.0 \
+  --delta-noise-warmup 2000 \
   --gamma 0.25 \
   --recon-weight 0.5 \
   --bulk-loss-weight 2.0 \
-  --hetero-weight 0.0 \
-  --delta-noise-scale 1.0 \
+  --action-aux-weight 0.01 \
   --eval-every 500 \
   --eval-top-genes 1000 \
   --eval-gene-selection hvg_test \
   --eval-cells 128 \
-  --eval-seed 123 \
-  --eval-batch-size 16 \
+  --eval-batch-size 32 \
+  --ode-method euler \
   --no-cell-eval \
   --precision fp16 \
   --log-every 25 \
   --use-mmd \
   --num-workers 2 \
-  --compile \
-  --compile-mode default
+  --compile
 ```
 
 ## 6. Outputs
