@@ -1,245 +1,181 @@
 import math
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ValueEncoder(nn.Module):
-    def __init__(self, dim: int, dropout: float):
+class GeneREPO(nn.Module):
+    """
+    Scalar position per gene per head from the gene hidden state via SwiGLU gating.
+    r_i = SiLU(h W_g) * (h W_c);  z_i = r_i W_z, W_z near zero so training starts
+    with no positional bias.
+    """
+    def __init__(self, embed_dim: int, num_heads: int, d_pos: int = None):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(1, dim),
-            nn.ReLU(),
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.Dropout(dropout),
-        )
+        if d_pos is None:
+            d_pos = max(embed_dim // 8, 16)
+        self.W_g = nn.Linear(embed_dim, d_pos, bias=False)
+        self.W_c = nn.Linear(embed_dim, d_pos, bias=False)
+        self.W_z = nn.Linear(d_pos, num_heads, bias=False)
+        nn.init.normal_(self.W_z.weight, std=0.01)
 
-    def forward(self, x):
-        return self.net(x.unsqueeze(-1))
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        r = F.silu(self.W_g(h)) * self.W_c(h)
+        return self.W_z(r)                       # (B, G, num_heads)
 
 
-
-class TimestepEmbedder(nn.Module):
-    def __init__(self, dim: int, freq_dim: int = 256):
+class WireRotaryEncoding(nn.Module):
+    """Holds the learnable WIRE frequency projection omega: (nhead, half, eigvec_dim)."""
+    def __init__(self, eigvec_dim: int, head_dim: int, nhead: int):
         super().__init__()
-        self.freq_dim = int(freq_dim)
-        self.net = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
-
-    def forward(self, t):
-        half = self.freq_dim // 2
-        freqs = torch.exp(
-            -math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half
-        )
-        args = t[:, None].float() * freqs[None]
-        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if self.freq_dim % 2:
-            emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
-        return self.net(emb)
+        self.half = head_dim // 2
+        omega = torch.zeros(nhead, self.half, eigvec_dim)
+        for f in range(self.half):
+            omega[:, f, f % eigvec_dim] = 1.0
+        self.omega = nn.Parameter(omega)
 
 
-
-
-def manifold_shift_anchors(manifold_dim: int, shift_dims: int = 0, stencil: str = "axis") -> torch.Tensor:
-    manifold_dim = int(manifold_dim)
-    shift_dims = manifold_dim if shift_dims <= 0 else min(int(shift_dims), manifold_dim)
-    if manifold_dim <= 0 or shift_dims <= 0:
-        raise ValueError("--directional-shifts needs --manifold-dim >= 1")
-    stencil = str(stencil).lower()
-    if stencil == "axis":
-        anchors = torch.zeros(2 * shift_dims, manifold_dim, dtype=torch.float32)
-        for i in range(shift_dims):
-            anchors[2 * i, i] = 1.0
-            anchors[2 * i + 1, i] = -1.0
-        return anchors
-    if stencil != "cube":
-        raise ValueError(f"Unsupported shift stencil: {stencil}")
-    directions = []
-    for linear in range(3**shift_dims):
-        value = linear
-        direction = []
-        for _ in range(shift_dims):
-            direction.append((value % 3) - 1)
-            value //= 3
-        if any(direction):
-            directions.append(direction)
-    anchors = torch.zeros(len(directions), manifold_dim, dtype=torch.float32)
-    anchors[:, :shift_dims] = torch.tensor(directions, dtype=torch.float32)
-    return anchors
-
-
-
-def manifold_shift_weights(
-    neighbors: torch.Tensor,
-    manifold_coords: torch.Tensor,
-    anchors: torch.Tensor,
-    temperature: float,
-) -> torch.Tensor:
-    coords = manifold_coords.float()
-    edge_delta = coords[neighbors.long()] - coords[:, None, :]
-    edge_delta = F.normalize(edge_delta, dim=-1, eps=1e-6)
-    anchors = F.normalize(anchors.float(), dim=-1, eps=1e-6)
-    scores = torch.einsum("gkm,rm->gkr", edge_delta, anchors)
-    return torch.softmax(scores * float(temperature), dim=-1).float()
-
-
-
-def fixed_shift_codes(anchors: torch.Tensor, dim: int) -> torch.Tensor:
-    anchors = F.normalize(anchors.float(), dim=-1, eps=1e-6)
-    channels = torch.arange(int(dim), dtype=torch.long)
-    patterns = []
-    for axis in range(anchors.size(1)):
-        period = 2 ** axis
-        pattern = torch.where((channels // period) % 2 == 0, 1.0, -1.0)
-        patterns.append(pattern)
-    pattern_matrix = torch.stack(patterns, dim=0).float()
-    directional = anchors @ pattern_matrix
-    return directional / directional.abs().amax(dim=1, keepdim=True).clamp_min(1.0)
-
-
-
-def auto_grid_shape(n_items: int, grid_dims: int, grid_side: int = 0) -> tuple[int, ...]:
-    grid_dims = int(grid_dims)
-    if grid_dims <= 0:
-        raise ValueError("--spatial-grid-shifts needs --spatial-grid-dims >= 1")
-    side = int(grid_side)
-    if side <= 0:
-        side = max(2, int(math.ceil(float(n_items) ** (1.0 / float(grid_dims)))))
-        while side**grid_dims < n_items:
-            side += 1
-    if side**grid_dims < n_items:
-        raise ValueError(f"Grid side {side} with {grid_dims} dims cannot hold {n_items} genes")
-    return tuple([side] * grid_dims)
-
-
-
-def assign_genes_to_grid(manifold_coords: torch.Tensor, grid_shape: tuple[int, ...]) -> torch.Tensor:
-    coords = manifold_coords.detach().cpu().numpy().astype(np.float32, copy=False)
-    dims = len(grid_shape)
-    if coords.shape[1] < dims:
-        coords = np.pad(coords, ((0, 0), (0, dims - coords.shape[1])), mode="constant")
-    coords = coords[:, :dims]
-    lo = coords.min(axis=0, keepdims=True)
-    hi = coords.max(axis=0, keepdims=True)
-    coords = (coords - lo) / np.maximum(hi - lo, 1e-6)
-    coords = coords * (np.asarray(grid_shape, dtype=np.float32)[None] - 1.0)
-
-    grid_points = np.stack(
-        np.meshgrid(*[np.arange(s, dtype=np.float32) for s in grid_shape], indexing="ij"),
-        axis=-1,
-    ).reshape(-1, dims)
-
-    try:
-        from scipy.optimize import linear_sum_assignment
-
-        cost = ((coords[:, None, :] - grid_points[None, :, :]) ** 2).sum(axis=-1)
-        rows, cols = linear_sum_assignment(cost)
-        gene_to_grid = np.empty(coords.shape[0], dtype=np.int64)
-        gene_to_grid[rows] = cols
-        return torch.tensor(gene_to_grid, dtype=torch.long)
-    except Exception:
-        used: set[int] = set()
-        gene_to_grid = np.empty(coords.shape[0], dtype=np.int64)
-        for gene_idx, point in enumerate(coords):
-            order = np.argsort(((grid_points - point[None]) ** 2).sum(axis=1))
-            for flat_idx in order:
-                flat_idx = int(flat_idx)
-                if flat_idx not in used:
-                    used.add(flat_idx)
-                    gene_to_grid[gene_idx] = flat_idx
-                    break
-        return torch.tensor(gene_to_grid, dtype=torch.long)
-
-
-
-def shift_nd_nonwrap(x: torch.Tensor, offsets: torch.Tensor | tuple[int, ...]) -> torch.Tensor:
-    offsets = [int(v) for v in offsets]
-    if not any(offsets):
-        return x
-    out = torch.zeros_like(x)
-    src = [slice(None), slice(None)]
-    dst = [slice(None), slice(None)]
-    for axis, delta in enumerate(offsets):
-        size = x.shape[2 + axis]
-        src_start = max(0, -delta)
-        src_end = size - max(0, delta)
-        dst_start = max(0, delta)
-        dst_end = size - max(0, -delta)
-        src.append(slice(src_start, src_end))
-        dst.append(slice(dst_start, dst_end))
-    out[tuple(dst)] = x[tuple(src)]
+def apply_rotary(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
+    """x: (..., head_dim); angles: (..., half) broadcastable to x's leading dims."""
+    half = angles.shape[-1]
+    cos, sin = angles.cos(), angles.sin()
+    x1, x2 = x[..., :half], x[..., half:2 * half]
+    out = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    if x.shape[-1] > 2 * half:
+        out = torch.cat([out, x[..., 2 * half:]], dim=-1)
     return out
 
 
+def lambda_init_fn(depth):
+    return 0.8 - 0.6 * math.exp(-0.3 * depth)
 
-class VoidGeneBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        hidden: int,
-        dropout: float,
-        residual_scale: float,
-        neighbor_gate: bool = False,
-        self_weight: float = 1.0,
-        neighbor_weight: float = 1.0,
-        global_weight: float = 1.0,
-        source_weight: float = 1.0,
-    ):
+
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine=True):
         super().__init__()
-        self.residual_scale = float(residual_scale)
-        self.use_neighbor_gate = bool(neighbor_gate)
-        self.self_weight = float(self_weight)
-        self.neighbor_weight = float(neighbor_weight)
-        self.global_weight = float(global_weight)
-        self.source_weight = float(source_weight)
-        self.gene_norm = nn.LayerNorm(dim)
-        self.global_norm = nn.LayerNorm(dim)
-        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
-        self.self_contract = nn.Linear(dim, hidden, bias=False)
-        self.source_contract = nn.Linear(dim, hidden, bias=False)
-        self.pos_neighbor_contract = nn.Linear(dim, hidden, bias=False)
-        self.neg_neighbor_contract = nn.Linear(dim, hidden, bias=False)
-        self.global_contract = nn.Linear(dim, hidden, bias=False)
-        if self.use_neighbor_gate:
-            self.neighbor_gate = nn.Sequential(
-                nn.Linear(2 * dim, hidden),
-                nn.SiLU(),
-                nn.Linear(hidden, 2 * hidden),
-                nn.Sigmoid(),
-            )
+        self.dim = dim
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
         else:
-            self.neighbor_gate = None
-        self.expand = nn.Linear(hidden, dim, bias=False)
-        self.global_update = nn.Sequential(
-            nn.Linear(2 * dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, dim),
+            self.register_parameter('weight', None)
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        out = self._norm(x.float()).type_as(x)
+        if self.weight is not None:
+            out = out * self.weight
+        return out
+
+
+class MultiheadDiffAttn(nn.Module):
+    """
+    Differential attention via the identity
+        (softmax(A1) - lambda * softmax(A2)) V = softmax(A1) V - lambda * softmax(A2) V,
+    so two scaled_dot_product_attention calls replace the explicit (B,H,G,G) maps.
+    REPO and WIRE are applied as additive rotary angles on q/k before attention.
+    """
+    def __init__(self, embed_dim, num_heads, depth, cross=False,
+                use_repo=True, use_wire=False, eigvec_dim=None):
+        super().__init__()
+        self.cross = cross
+        self.use_repo = use_repo
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.half = self.head_dim // 2
+
+        self.q_proj_1 = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k_proj_1 = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.q_proj_2 = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k_proj_2 = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v_proj   = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        self.lambda_init = lambda_init_fn(depth)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim).normal_(0, 0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim).normal_(0, 0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim).normal_(0, 0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim).normal_(0, 0.1))
+
+        self.lambda_proj = nn.Linear(embed_dim, num_heads, bias=False)
+        nn.init.zeros_(self.lambda_proj.weight)
+
+        self.subln = RMSNorm(self.head_dim, eps=1e-5, elementwise_affine=True)
+
+        if use_repo:
+            self.repo_query   = GeneREPO(embed_dim, num_heads)
+            self.repo_context = GeneREPO(embed_dim, num_heads)
+        self.wire = WireRotaryEncoding(eigvec_dim, self.head_dim, num_heads) \
+            if (use_wire and eigvec_dim is not None) else None
+
+        self.register_buffer(
+            'freqs',
+            1.0 / (10000.0 ** (torch.arange(0, self.half).float() / self.half)),
+            persistent=False,
         )
-        self.drop = nn.Dropout(dropout)
 
-    def forward(self, x, global_state, pos_neighbor_mean, neg_neighbor_mean, condition, source_state=None):
-        sx, ax, gx, sg, ag, gg = self.ada(condition).chunk(6, dim=-1)
-        x_mod = self.gene_norm(x) * (1.0 + ax[:, None, :]) + sx[:, None, :]
-        g_mod = self.global_norm(global_state) * (1.0 + ag) + sg
-        mixed = self.self_weight * self.self_contract(x_mod)
-        if source_state is not None and self.source_weight != 0.0:
-            source_mod = self.gene_norm(source_state)
-            mixed = mixed + self.source_weight * self.source_contract(source_mod)
-        pos_msg = self.pos_neighbor_contract(pos_neighbor_mean)
-        neg_msg = self.neg_neighbor_contract(neg_neighbor_mean)
-        if self.neighbor_gate is not None:
-            pos_gate, neg_gate = self.neighbor_gate(torch.cat([g_mod, condition], dim=-1)).chunk(2, dim=-1)
-            pos_msg = pos_gate[:, None, :] * pos_msg
-            neg_msg = neg_gate[:, None, :] * neg_msg
-        mixed = mixed + self.neighbor_weight * pos_msg
-        mixed = mixed + self.neighbor_weight * neg_msg
-        mixed = mixed + self.global_weight * self.global_contract(g_mod[:, None, :])
-        dx = self.expand(self.drop(F.gelu(mixed)))
-        x = x + self.residual_scale * torch.tanh(gx[:, None, :]) * dx
-        pooled = x.mean(dim=1)
-        dg = self.global_update(torch.cat([g_mod, pooled], dim=-1))
-        global_state = global_state + self.residual_scale * torch.tanh(gg) * dg
-        return x, global_state
+    def _angles(self, z, coords):
+        ang = None
+        if self.use_repo and z is not None:
+            ang = z.permute(0, 2, 1).unsqueeze(-1).float() * self.freqs   # (B, H, L, half)
+        if self.wire is not None and coords is not None:
+            w = torch.einsum('ble,hfe->bhlf', coords.float(), self.wire.omega.float())
+            ang = w if ang is None else ang + w
+        return ang
 
+    def forward(self, noisy_y, x, spectral_coords=None, perturbation_emb=None):
+        B, T, _ = noisy_y.shape
+        H, Dh = self.num_heads, self.head_dim
+
+        z_n = self.repo_query(noisy_y) if self.use_repo else None
+        z_x = self.repo_context(x) if self.use_repo else None
+
+        if self.cross:
+            q1, k1 = self.q_proj_1(noisy_y), self.k_proj_1(x)
+            q2, k2 = self.q_proj_2(noisy_y), self.k_proj_2(x)
+            zq1, zk1, zq2, zk2 = z_n, z_x, z_n, z_x
+        else:
+            q1, k1 = self.q_proj_1(noisy_y), self.k_proj_1(noisy_y)
+            q2, k2 = self.q_proj_2(x), self.k_proj_2(x)
+            zq1, zk1, zq2, zk2 = z_n, z_n, z_n, z_x
+        v = self.v_proj(noisy_y)
+
+        def shp(t):
+            return t.view(B, t.shape[1], H, Dh).transpose(1, 2)
+        q1, k1, q2, k2, v = shp(q1), shp(k1), shp(q2), shp(k2), shp(v)
+
+        def rot(tensor, z):
+            if spectral_coords is None and not self.use_repo:
+                return tensor
+            L = tensor.shape[2]
+            coords = spectral_coords[:, :L] if spectral_coords is not None else None
+            ang = self._angles(z, coords)
+            if ang is None:
+                return tensor
+            return apply_rotary(tensor.float(), ang).type_as(tensor)
+        q1, k1, q2, k2 = rot(q1, zq1), rot(k1, zk1), rot(q2, zq2), rot(k2, zk2)
+
+        lambda_1 = torch.exp((self.lambda_q1 * self.lambda_k1).sum().float()).type_as(q1)
+        lambda_2 = torch.exp((self.lambda_q2 * self.lambda_k2).sum().float()).type_as(q1)
+        lambda_base = lambda_1 - lambda_2 + self.lambda_init
+
+        if perturbation_emb is not None:
+            lambda_delta = torch.sigmoid(self.lambda_proj(perturbation_emb))   # (B, H)
+            lambda_full = lambda_base + lambda_delta.unsqueeze(2).unsqueeze(3) # (B, H, 1, 1)
+        else:
+            lambda_full = lambda_base
+
+        o1 = F.scaled_dot_product_attention(q1, k1, v)
+        o2 = F.scaled_dot_product_attention(q2, k2, v)
+        attn = o1 - lambda_full * o2
+
+        attn = self.subln(attn) * (1 - self.lambda_init)
+        attn = attn.transpose(1, 2).reshape(B, T, H * Dh)
+        return self.out_proj(attn)
