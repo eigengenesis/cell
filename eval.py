@@ -49,6 +49,14 @@ def make_flow_noise(source, args, eval_mode: bool = False, delta_noise_scale: fl
         if eval_mode and args.eval_delta_noise_scale is not None:
             scale = args.eval_delta_noise_scale
         return torch.randn_like(source) * float(scale)
+    if eval_mode:
+        eval_cell_noise = getattr(args, "eval_cell_noise", "train")
+        if eval_cell_noise == "source":
+            return source
+        if eval_cell_noise == "poisson":
+            return make_lognorm_poisson_noise(source)
+        if eval_cell_noise == "gaussian":
+            return torch.randn_like(source)
     if args.noise == "poisson":
         return make_lognorm_poisson_noise(source)
     return torch.randn_like(source)
@@ -234,6 +242,7 @@ def build_eval_predictions(model, data: PreparedData, args, device, eval_seed: i
             f"batch {args.eval_batch_size} | ode_steps {args.ode_steps} | "
             f"ode_method {getattr(args, 'ode_method', 'euler')} | "
             f"eval_delta_noise {getattr(args, 'eval_delta_noise_scale', None)} | "
+            f"eval_cell_noise {getattr(args, 'eval_cell_noise', 'train')} | "
             f"forwards/condition {n_batches_preview * args.ode_steps} | "
             f"genes {len(gene_idx)} {getattr(args, 'eval_gene_selection', 'mean')}",
             flush=True,
@@ -284,6 +293,7 @@ def build_eval_predictions(model, data: PreparedData, args, device, eval_seed: i
         ref = train_reference_mean(data, cond, gene_idx, control_mean)
         residual_pred = pred[:n_pair] - ref
         residual_true = pair_target - ref
+        source_residual = src_all[:n_pair] - control_mean
         variance = residual_true.var(axis=0)
         top20_var = np.argsort(variance)[-min(20, len(variance)) :]
 
@@ -298,6 +308,8 @@ def build_eval_predictions(model, data: PreparedData, args, device, eval_seed: i
                 "Pearson_Delta_Source": pearson(delta_pred_source, delta_true),
                 "Pearson_Delta_Hat": pearson_residual_rows(residual_pred, residual_true),
                 "Pearson_Delta_Hat20": pearson_residual_rows(residual_pred[:, top20_var], residual_true[:, top20_var]),
+                "Pearson_Source_Hat": pearson_residual_rows(residual_pred, source_residual),
+                "Pearson_Source_Hat20": pearson_residual_rows(residual_pred[:, top20_var], source_residual[:, top20_var]),
                 "DE-Spearman_fast_top20": pearson(rankdata(delta_pred[top20_delta]), rankdata(delta_true[top20_delta])),
             }
         )
@@ -342,6 +354,8 @@ def aggregate_metric_rows(rows: list[dict], args, kind: str | None = None) -> di
         "Pearson_Delta_Source",
         "Pearson_Delta_Hat",
         "Pearson_Delta_Hat20",
+        "Pearson_Source_Hat",
+        "Pearson_Source_Hat20",
         "DE-Spearman_fast_top20",
     ]:
         agg[key] = float(np.nanmean([r[key] for r in selected]))
@@ -427,6 +441,7 @@ def evaluate(model, data: PreparedData, args, device, out_dir: Path | None = Non
         if eval_noise is None:
             eval_noise = getattr(args, "delta_noise_scale", float("nan"))
         metrics["EvalDeltaNoiseScale"] = eval_noise
+        metrics["EvalCellNoise"] = getattr(args, "eval_cell_noise", "train")
         metrics["DE-Spearman"] = metrics.get("DE-Spearman_fast_top20", float("nan"))
         metrics["DS"] = float("nan")
         metrics["DM"] = float("nan")
@@ -459,6 +474,7 @@ def write_metrics(path: Path, metrics: dict):
         "EvalOdeMethod",
         "EvalOdeSteps",
         "EvalDeltaNoiseScale",
+        "EvalCellNoise",
         "L2",
         "MSE",
         "MAE",
@@ -469,6 +485,8 @@ def write_metrics(path: Path, metrics: dict):
         "DM",
         "Pearson_Delta_Hat",
         "Pearson_Delta_Hat20",
+        "Pearson_Source_Hat",
+        "Pearson_Source_Hat20",
     ]
     exists = path.exists()
     with path.open("a", newline="") as f:
@@ -485,6 +503,7 @@ def metrics_log_line(metrics: dict) -> str:
         f"GeneSel {metrics.get('EvalGeneSelection', 'n/a')}",
         f"ODE {metrics.get('EvalOdeMethod', 'euler')}/{metrics.get('EvalOdeSteps', 'n/a')}",
         f"EvalNoise {format_metric(metrics.get('EvalDeltaNoiseScale'))}",
+        f"EvalCellNoise {metrics.get('EvalCellNoise', 'train')}",
         f"L2 {format_metric(metrics.get('L2'))}",
         f"MSE {format_metric(metrics.get('MSE'), 5)}",
         f"MAE {format_metric(metrics.get('MAE'), 5)}",
@@ -495,5 +514,7 @@ def metrics_log_line(metrics: dict) -> str:
         f"DM {format_metric(metrics.get('DM'))}",
         f"PearsonHat {format_metric(metrics.get('Pearson_Delta_Hat'))}",
         f"PearsonHat20 {format_metric(metrics.get('Pearson_Delta_Hat20'))}",
+        f"SrcHat {format_metric(metrics.get('Pearson_Source_Hat'))}",
+        f"SrcHat20 {format_metric(metrics.get('Pearson_Source_Hat20'))}",
     ]
     return "[eval] " + " | ".join(parts)

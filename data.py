@@ -215,10 +215,18 @@ def build_prepared(adata, conditions, modes, is_control, store_dtype: str) -> Pr
     )
 
 class PerturbationBatchDataset(Dataset):
-    def __init__(self, data: PreparedData, batch_size: int, repeats: int = 1000, mixed_conditions: bool = False):
+    def __init__(
+        self,
+        data: PreparedData,
+        batch_size: int,
+        repeats: int = 1000,
+        mixed_conditions: bool = False,
+        condition_cycle: bool = False,
+    ):
         self.data = data
         self.batch_size = int(batch_size)
         self.mixed_conditions = bool(mixed_conditions)
+        self.condition_cycle = bool(condition_cycle)
         self.conditions = data.train_conditions
         self.repeats = int(repeats)
         self.control_idx = np.where(data.is_control)[0]
@@ -230,6 +238,13 @@ class PerturbationBatchDataset(Dataset):
         self.conditions = sorted(self.by_condition)
         if len(self.conditions) == 0:
             raise ValueError("No train perturbation conditions found.")
+        control_mean = data.x[self.control_idx].astype(np.float32, copy=False).mean(axis=0)
+        self.condition_delta_by_name = {
+            cond: (
+                data.x[idx].astype(np.float32, copy=False).mean(axis=0) - control_mean
+            ).astype(np.float32, copy=False)
+            for cond, idx in self.by_condition.items()
+        }
 
     def __len__(self):
         return len(self.conditions) * self.repeats
@@ -243,12 +258,19 @@ class PerturbationBatchDataset(Dataset):
                 target_indices.append(np.random.choice(self.by_condition[cond]))
             tgt_idx = np.asarray(target_indices, dtype=np.int64)
         else:
-            cond = random.choice(self.conditions)
+            if self.condition_cycle:
+                cond = self.conditions[int(_idx) % len(self.conditions)]
+            else:
+                cond = random.choice(self.conditions)
             tgt_idx = np.random.choice(self.by_condition[cond], self.batch_size, replace=True)
+        condition_delta = np.stack(
+            [self.condition_delta_by_name[str(cond)] for cond in self.data.conditions[tgt_idx]],
+            axis=0,
+        )
         return {
             "source": torch.from_numpy(self.data.x[src_idx]),
             "target": torch.from_numpy(self.data.x[tgt_idx]),
             "perturbation_id": torch.from_numpy(self.data.perturbation_ids[tgt_idx]),
             "perturbation_gene_id": torch.from_numpy(self.data.perturbation_gene_ids[tgt_idx]),
+            "condition_delta": torch.from_numpy(condition_delta),
         }
-
