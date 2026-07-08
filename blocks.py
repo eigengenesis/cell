@@ -55,6 +55,30 @@ class TimestepEmbedder(nn.Module):
         return self.mlp(self.timestep_embedding(t, self.frequency_embedding_size))
 
 
+class WireRotaryEncoding(nn.Module):
+    """Compatibility helper for the optional legacy neighbor-attention layers."""
+
+    def __init__(self, eigvec_dim: int, head_dim: int, nhead: int):
+        super().__init__()
+        half = head_dim // 2
+        omega = torch.zeros(nhead, half, eigvec_dim)
+        for freq in range(half):
+            omega[:, freq, freq % max(eigvec_dim, 1)] = 1.0
+        self.half = half
+        self.omega = nn.Parameter(omega)
+
+
+def apply_rotary(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
+    """Apply rotary mixing to the first 2 * half channels of x."""
+    half = angles.shape[-1]
+    cos, sin = angles.cos(), angles.sin()
+    x1, x2 = x[..., :half], x[..., half : 2 * half]
+    out = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    if x.shape[-1] > 2 * half:
+        out = torch.cat([out, x[..., 2 * half :]], dim=-1)
+    return out
+
+
 def manifold_shift_anchors(manifold_dim: int, shift_dims: int = 0, stencil: str = "axis") -> torch.Tensor:
     manifold_dim = int(manifold_dim)
     if manifold_dim <= 0:
