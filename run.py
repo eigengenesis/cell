@@ -116,6 +116,117 @@ def scheduled_weight(
     return current * (1.0 - blend) + float(final_weight) * blend
 
 
+def deg_weights_from_condition_delta(
+    condition_delta: torch.Tensor | None,
+    sample_genes: torch.Tensor,
+    epsilon: float,
+) -> torch.Tensor | None:
+    if condition_delta is None:
+        return None
+    lfc = condition_delta[:, sample_genes].abs().float().mean(dim=0)
+    max_lfc = lfc.max().clamp_min(1e-12)
+    return float(epsilon) + (1.0 - float(epsilon)) * (lfc / max_lfc)
+
+
+def weighted_sqdist(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    w: torch.Tensor | None = None,
+    normalize: bool = False,
+) -> torch.Tensor:
+    x = x.float()
+    y = y.float()
+    if w is not None:
+        scale = w.float().clamp_min(0.0).sqrt()
+        x = x * scale
+        y = y * scale
+        denom = w.float().clamp_min(0.0).sum().clamp_min(1e-6)
+    else:
+        denom = torch.as_tensor(max(x.size(-1), 1), device=x.device, dtype=x.dtype)
+    cost = torch.cdist(x, y, p=2).square()
+    return cost / denom if normalize else cost
+
+
+def sinkhorn_value(cost: torch.Tensor, eps: torch.Tensor | float, n_iters: int) -> torch.Tensor:
+    cost = cost.float()
+    eps = torch.as_tensor(eps, device=cost.device, dtype=cost.dtype).clamp_min(1e-6)
+    m, n = cost.shape
+    log_a = torch.full((m,), -math.log(max(m, 1)), device=cost.device, dtype=cost.dtype)
+    log_b = torch.full((n,), -math.log(max(n, 1)), device=cost.device, dtype=cost.dtype)
+    f = torch.zeros(m, device=cost.device, dtype=cost.dtype)
+    g = torch.zeros(n, device=cost.device, dtype=cost.dtype)
+    for _ in range(int(n_iters)):
+        f = eps * (log_a - torch.logsumexp((g[None, :] - cost) / eps + log_b[None, :], dim=1))
+        g = eps * (log_b - torch.logsumexp((f[:, None] - cost) / eps + log_a[:, None], dim=0))
+    return torch.dot(f, log_a.exp()) + torch.dot(g, log_b.exp())
+
+
+def sinkhorn_divergence(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    eps_scale: float,
+    n_iters: int,
+    w: torch.Tensor | None = None,
+    normalize_cost: bool = True,
+) -> torch.Tensor:
+    with torch.no_grad():
+        median_cost = torch.median(
+            weighted_sqdist(x.detach(), y.detach(), w, normalize=normalize_cost)
+        ).clamp_min(1e-6)
+        eps = (float(eps_scale) * median_cost).clamp_min(1e-3)
+    xy = sinkhorn_value(weighted_sqdist(x, y, w, normalize=normalize_cost), eps, n_iters)
+    xx = sinkhorn_value(weighted_sqdist(x, x, w, normalize=normalize_cost), eps, n_iters)
+    yy = sinkhorn_value(weighted_sqdist(y, y, w, normalize=normalize_cost), eps, n_iters)
+    return xy - 0.5 * xx - 0.5 * yy
+
+
+def endpoint_loss_kind(args) -> str:
+    if args.endpoint_loss != "auto":
+        return args.endpoint_loss
+    return "mmd" if args.use_mmd else "none"
+
+
+def compute_endpoint_loss(
+    x1_hat: torch.Tensor,
+    target: torch.Tensor,
+    condition_delta: torch.Tensor | None,
+    sample_genes: torch.Tensor,
+    args,
+) -> tuple[torch.Tensor, str]:
+    kind = endpoint_loss_kind(args)
+    if kind == "none":
+        return x1_hat.new_tensor(0.0), kind
+
+    x = x1_hat[:, sample_genes].float()
+    y = target[:, sample_genes].float()
+    w = None
+    if kind in {"deg_mse", "deg_sinkhorn"}:
+        w = deg_weights_from_condition_delta(condition_delta, sample_genes, args.deg_weight_epsilon)
+        if w is None:
+            kind = "mmd"
+
+    if kind == "mmd":
+        sigmas = median_sigmas(y)
+        return mmd_multi_sigma(x, y, sigmas), kind
+    if kind == "deg_mse":
+        weighted_mse = (w[None, :] * (x - y).square()).mean()
+        sigmas = median_sigmas(y, scales=(1.0, 2.0))
+        return weighted_mse + float(args.deg_mse_mmd_weight) * mmd_multi_sigma(x, y, sigmas), kind
+    if kind in {"sinkhorn", "deg_sinkhorn"}:
+        loss = sinkhorn_divergence(
+            x,
+            y,
+            args.sinkhorn_eps,
+            args.sinkhorn_iters,
+            w=w,
+            normalize_cost=args.sinkhorn_normalize_cost,
+        )
+        if not torch.isfinite(loss):
+            return x1_hat.new_tensor(0.0), f"{kind}_nonfinite"
+        return loss, kind
+    raise ValueError(f"Unsupported endpoint loss: {kind}")
+
+
 def train_step(model, batch, args, device, step: int = 0):
     source = batch["source"].to(device=device, dtype=torch.float32)
     target = batch["target"].to(device=device, dtype=torch.float32)
@@ -273,12 +384,9 @@ def train_step(model, batch, args, device, step: int = 0):
         loss = loss + args.action_aux_weight * action_aux
     else:
         action_aux = loss.new_tensor(0.0)
-    if args.use_mmd:
-        sigmas = median_sigmas(target[:, sample_genes])
-        mmd = mmd_multi_sigma(x1_hat[:, sample_genes], target[:, sample_genes], sigmas)
-        loss = loss + args.gamma * mmd
-    else:
-        mmd = loss.new_tensor(0.0)
+    endpoint, endpoint_kind = compute_endpoint_loss(x1_hat, target, condition_delta, sample_genes, args)
+    if endpoint_kind != "none":
+        loss = loss + args.gamma * endpoint
     parts = {
         "flow": float(flow_loss.detach().item()),
         "dir": float(dir_loss.detach().item()),
@@ -298,7 +406,9 @@ def train_step(model, batch, args, device, step: int = 0):
         "w_recon": recon_weight,
         "w_bulk": bulk_loss_weight,
         "w_bulk_mae": bulk_mae_weight,
-        "mmd": float(mmd.detach().item()),
+        "endpoint": float(endpoint.detach().item()),
+        "endpoint_kind": endpoint_kind,
+        "mmd": float(endpoint.detach().item()) if endpoint_kind == "mmd" else 0.0,
         "noise": float(noise_scale) if noise_scale is not None else float("nan"),
     }
     return loss, parts
@@ -395,8 +505,9 @@ def train_log_line(
         )
         if math.isfinite(loss_parts.get("noise", float("nan"))):
             parts.append(f"noise {loss_parts.get('noise', 0.0):.3f}")
-        if args.use_mmd:
-            parts.append(f"mmd {loss_parts.get('mmd', 0.0):.4f}")
+        endpoint_kind = str(loss_parts.get("endpoint_kind", "none"))
+        if endpoint_kind != "none":
+            parts.append(f"endpoint {endpoint_kind}:{loss_parts.get('endpoint', 0.0):.4f}")
     if args.max_hours > 0:
         limit = args.max_hours * 3600.0
         parts.append(f"wall_left {format_duration(max(limit - elapsed, 0.0))}")
@@ -1103,7 +1214,14 @@ def parse_args():
     p.add_argument("--delta-noise-warmup", type=int, default=2000)
     p.add_argument("--eval-delta-noise-scale", type=float, default=None)
     p.add_argument("--use-mmd", action="store_true")
+    p.add_argument("--endpoint-loss", choices=["auto", "none", "mmd", "sinkhorn", "deg_mse", "deg_sinkhorn"], default="auto")
     p.add_argument("--gamma", type=float, default=0.5)
+    p.add_argument("--deg-weight-epsilon", type=float, default=0.1)
+    p.add_argument("--deg-mse-mmd-weight", type=float, default=0.1)
+    p.add_argument("--sinkhorn-eps", type=float, default=0.1)
+    p.add_argument("--sinkhorn-iters", type=int, default=50)
+    p.add_argument("--sinkhorn-normalize-cost", dest="sinkhorn_normalize_cost", action="store_true", default=True)
+    p.add_argument("--no-sinkhorn-normalize-cost", dest="sinkhorn_normalize_cost", action="store_false")
     p.add_argument("--dir-weight", type=float, default=0.0)
     p.add_argument("--hetero-weight", type=float, default=0.0)
     p.add_argument("--action-aux-weight", type=float, default=0.01)
