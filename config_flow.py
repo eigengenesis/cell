@@ -45,6 +45,7 @@ class FlowConfig:
     # Curated GRN graph (STRING / Reactome / GO / GRNdb) as a 2-column gene-name-pair CSV.
     # Empty string disables the second graph pass.
     grn_mask_path: str = ''
+    use_signed_edges: bool = False
     def __post_init__(self):
         if self.data_name == 'norman_umi_go_filtered':
             self.n_top_genes = 5054

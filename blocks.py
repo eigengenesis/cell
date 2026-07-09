@@ -55,30 +55,6 @@ class TimestepEmbedder(nn.Module):
         return self.mlp(self.timestep_embedding(t, self.frequency_embedding_size))
 
 
-class WireRotaryEncoding(nn.Module):
-    """Compatibility helper for the optional legacy neighbor-attention layers."""
-
-    def __init__(self, eigvec_dim: int, head_dim: int, nhead: int):
-        super().__init__()
-        half = head_dim // 2
-        omega = torch.zeros(nhead, half, eigvec_dim)
-        for freq in range(half):
-            omega[:, freq, freq % max(eigvec_dim, 1)] = 1.0
-        self.half = half
-        self.omega = nn.Parameter(omega)
-
-
-def apply_rotary(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
-    """Apply rotary mixing to the first 2 * half channels of x."""
-    half = angles.shape[-1]
-    cos, sin = angles.cos(), angles.sin()
-    x1, x2 = x[..., :half], x[..., half : 2 * half]
-    out = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
-    if x.shape[-1] > 2 * half:
-        out = torch.cat([out, x[..., 2 * half :]], dim=-1)
-    return out
-
-
 def manifold_shift_anchors(manifold_dim: int, shift_dims: int = 0, stencil: str = "axis") -> torch.Tensor:
     manifold_dim = int(manifold_dim)
     if manifold_dim <= 0:
@@ -159,7 +135,7 @@ def assign_genes_to_grid(manifold_coords: torch.Tensor, grid_shape: tuple[int, .
     return grid_idx
 
 
-def shift_nd_nonwrap(x: torch.Tensor, offset: torch.Tensor | list[int] | tuple[int, ...]) -> torch.Tensor:
+def shift_nd_nonwrap(x: torch.Tensor, offset) -> torch.Tensor:
     offset = [int(v) for v in offset]
     out = torch.zeros_like(x)
     prefix = x.dim() - len(offset)
@@ -190,7 +166,7 @@ class AdaLN(nn.Module):
 
 
 class VoidGeneBlock(nn.Module):
-    """Attention-free VOID gene block with signed neighbor transport and global state."""
+    """Attention-free gene block with signed neighbor transport and a global state."""
 
     def __init__(
         self,
@@ -198,11 +174,12 @@ class VoidGeneBlock(nn.Module):
         hidden: int,
         dropout: float = 0.0,
         residual_scale: float = 0.1,
-        neighbor_gate: bool = False,
+        neighbor_gate: bool = True,
         self_weight: float = 1.0,
         neighbor_weight: float = 1.0,
         global_weight: float = 1.0,
         source_weight: float = 1.0,
+        use_signed_neighbors: bool = True,
     ):
         super().__init__()
         self.residual_scale = float(residual_scale)
@@ -211,26 +188,37 @@ class VoidGeneBlock(nn.Module):
         self.neighbor_weight = float(neighbor_weight)
         self.global_weight = float(global_weight)
         self.source_weight = float(source_weight)
+        self.use_signed_neighbors = bool(use_signed_neighbors)
 
         self.gene_norm = nn.LayerNorm(dim)
         self.pos_norm = nn.LayerNorm(dim)
-        self.neg_norm = nn.LayerNorm(dim)
         self.global_norm = nn.LayerNorm(dim)
         self.source_norm = nn.LayerNorm(dim)
         self.ada = AdaLN(dim, chunks=6)
 
         self.self_contract = nn.Linear(dim, hidden, bias=False)
         self.pos_neighbor_contract = nn.Linear(dim, hidden, bias=False)
-        self.neg_neighbor_contract = nn.Linear(dim, hidden, bias=False)
         self.global_contract = nn.Linear(dim, hidden, bias=False)
         self.source_contract = nn.Linear(dim, hidden, bias=False)
         self.expand = nn.Linear(hidden, dim, bias=False)
 
+        contract_layers = [self.self_contract, self.pos_neighbor_contract,
+                            self.global_contract, self.source_contract]
+
+        if self.use_signed_neighbors:
+            self.neg_norm = nn.LayerNorm(dim)
+            self.neg_neighbor_contract = nn.Linear(dim, hidden, bias=False)
+            contract_layers.append(self.neg_neighbor_contract)
+        else:
+            self.neg_norm = None
+            self.neg_neighbor_contract = None
+
+        gate_out = 2 * dim if self.use_signed_neighbors else dim
         if self.neighbor_gate_enabled:
             self.neighbor_gate = nn.Sequential(
                 nn.Linear(2 * dim, hidden),
                 nn.SiLU(),
-                nn.Linear(hidden, 2 * dim),
+                nn.Linear(hidden, gate_out),
                 nn.Sigmoid(),
             )
         else:
@@ -245,26 +233,35 @@ class VoidGeneBlock(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.act = nn.GELU()
 
-        for layer in (
-            self.self_contract,
-            self.pos_neighbor_contract,
-            self.neg_neighbor_contract,
-            self.global_contract,
-            self.source_contract,
-        ):
+        for layer in contract_layers:
             nn.init.trunc_normal_(layer.weight, std=0.02)
         nn.init.trunc_normal_(self.expand.weight, std=0.01)
+
+    def precompute(self, condition: torch.Tensor, source_state: torch.Tensor | None):
+        ada = self.ada(condition).chunk(6, dim=-1)
+        if source_state is not None and self.source_weight != 0.0:
+            src_contrib = self.source_weight * self.source_contract(self.source_norm(source_state))
+            source_pooled = source_state.mean(dim=1)
+        else:
+            src_contrib = None
+            source_pooled = None
+        return ada, src_contrib, source_pooled
 
     def forward(
         self,
         x: torch.Tensor,
         global_state: torch.Tensor,
         pos_msg: torch.Tensor,
-        neg_msg: torch.Tensor,
+        neg_msg: torch.Tensor | None,
         condition: torch.Tensor,
         source_state: torch.Tensor | None = None,
+        cache: tuple | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        shift_x, scale_x, gate_x, shift_g, scale_g, gate_g = self.ada(condition).chunk(6, dim=-1)
+        if cache is None:
+            ada, src_contrib, source_pooled = self.precompute(condition, source_state)
+        else:
+            ada, src_contrib, source_pooled = cache
+        shift_x, scale_x, gate_x, shift_g, scale_g, gate_g = ada
 
         x_mod = self.gene_norm(x)
         x_mod = x_mod * (1.0 + scale_x[:, None, :]) + shift_x[:, None, :]
@@ -272,26 +269,34 @@ class VoidGeneBlock(nn.Module):
         g_mod = g_mod * (1.0 + scale_g) + shift_g
 
         pos_mod = self.pos_norm(pos_msg)
-        neg_mod = self.neg_norm(neg_msg)
+        if self.use_signed_neighbors:
+            neg_mod = self.neg_norm(neg_msg)
         if self.neighbor_gate is not None:
             gate = self.neighbor_gate(torch.cat([g_mod, condition], dim=-1))
-            pos_gate, neg_gate = gate.chunk(2, dim=-1)
+            if self.use_signed_neighbors:
+                pos_gate, neg_gate = gate.chunk(2, dim=-1)
+                neg_mod = neg_mod * neg_gate[:, None, :]
+            else:
+                pos_gate = gate
             pos_mod = pos_mod * pos_gate[:, None, :]
-            neg_mod = neg_mod * neg_gate[:, None, :]
 
         mixed = self.self_weight * self.self_contract(x_mod)
-        mixed = mixed + self.neighbor_weight * (
-            self.pos_neighbor_contract(pos_mod) + self.neg_neighbor_contract(neg_mod)
-        )
+        if self.use_signed_neighbors:
+            mixed = mixed + self.neighbor_weight * (
+                self.pos_neighbor_contract(pos_mod) + self.neg_neighbor_contract(neg_mod)
+            )
+        else:
+            mixed = mixed + self.neighbor_weight * self.pos_neighbor_contract(pos_mod)
         mixed = mixed + self.global_weight * self.global_contract(g_mod[:, None, :])
-        if source_state is not None and self.source_weight != 0.0:
-            mixed = mixed + self.source_weight * self.source_contract(self.source_norm(source_state))
+        if src_contrib is not None:
+            mixed = mixed + src_contrib
 
         dx = self.expand(self.drop(self.act(mixed)))
         x = x + self.residual_scale * torch.tanh(gate_x[:, None, :]) * dx
 
         pooled = x.mean(dim=1)
-        source_pooled = pooled if source_state is None else source_state.mean(dim=1)
+        if source_pooled is None:
+            source_pooled = pooled
         dg = self.global_update(torch.cat([g_mod, pooled, source_pooled], dim=-1))
         global_state = global_state + self.residual_scale * torch.tanh(gate_g) * dg
         return x, global_state

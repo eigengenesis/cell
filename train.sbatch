@@ -10,6 +10,7 @@
 #SBATCH --mail-type=FAIL
 #SBATCH --job-name=scdfm
 #SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 
 starts=$(date +"%s")
 start=$(date +"%r, %m-%d-%Y")

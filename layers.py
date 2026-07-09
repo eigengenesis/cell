@@ -2,202 +2,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from typing import Optional, Dict
-import math
-import torch.nn.functional as F
-from .blocks import WireRotaryEncoding, apply_rotary
-
-
-class GeneNeighborAttention(nn.Module):
-    """
-    Each query gene attends only to its k graph neighbors. Keys and values are
-    computed once per forward as (G_q, cap, H, Dh) (batch-independent: they come
-    from the embedding table and the fixed neighbor table) and broadcast over the
-    batch in the final einsum. WIRE rotary is applied batch-free on the neighbor
-    coordinates. Genes with no valid neighbor produce a zero update via nan_to_num.
-    """
-    def __init__(self, d_model, nhead, mlp_ratio=4, dropout=0.1, eigvec_dim=None, use_wire=True):
-        super().__init__()
-        assert d_model % nhead == 0
-        self.nhead = nhead
-        self.head_dim = d_model // nhead
-        self.scaling = self.head_dim ** -0.5
-        self.use_wire = use_wire and eigvec_dim is not None
-
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
-
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.drop = nn.Dropout(dropout)
-        ffn = int(mlp_ratio * d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, ffn), nn.GELU(), nn.Dropout(dropout), nn.Linear(ffn, d_model)
-        )
-        if self.use_wire:
-            self.wire = WireRotaryEncoding(eigvec_dim, self.head_dim, nhead)
-
-    def forward(self, x, nbr_emb, valid, coords_q=None, coords_nbr=None):
-        # x: (B, G, d); nbr_emb: (G, cap, d); valid: (G, cap) bool
-        # coords_q: (G, e); coords_nbr: (G, cap, e)
-        B, G, d = x.shape
-        cap = nbr_emb.shape[1]
-        H, Dh = self.nhead, self.head_dim
-
-        q = self.q_proj(self.norm1(x)).view(B, G, H, Dh)
-        k = self.k_proj(nbr_emb).view(G, cap, H, Dh)
-        v = self.v_proj(nbr_emb).view(G, cap, H, Dh)
-
-        if self.use_wire and coords_q is not None:
-            aq = torch.einsum('ge,hfe->ghf', coords_q.float(), self.wire.omega.float())
-            q = apply_rotary(q.float(), aq).type_as(q)
-            ak = torch.einsum('gke,hfe->gkhf', coords_nbr.float(), self.wire.omega.float())
-            k = apply_rotary(k.float(), ak).type_as(k)
-
-        attn = torch.einsum('bghd,gkhd->bghk', q * self.scaling, k)            # (B, G, H, cap)
-        attn = attn.masked_fill(~valid.view(1, G, 1, cap), float('-inf'))
-        attn = F.softmax(attn, dim=-1, dtype=torch.float32).type_as(attn)
-        attn = torch.nan_to_num(attn, nan=0.0)                                 # empty rows -> zero update
-        attn = self.drop(attn)
-
-        out = torch.einsum('bghk,gkhd->bghd', attn, v).reshape(B, G, d)
-        out = self.out_proj(out)
-
-        x = x + self.drop(out)
-        x = x + self.drop(self.ffn(self.norm2(x)))
-        return x
-
-
-class GeneadaLN(nn.Module):
-    def __init__(self, hidden_size: int, dropout: float = 0.1):
-        super().__init__()
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 3 * hidden_size, bias=True)
-        )
-        self.norm = nn.LayerNorm(hidden_size)
-
-    def forward(self, gene_emb: Tensor, value_emb: Tensor) -> Tensor:
-        shift, gate, scale = self.adaLN_modulation(gene_emb).chunk(3, dim=-1)
-        return value_emb + gate * (self.norm(value_emb) * scale + shift)
-
-
-class ContinuousValueEncoder(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.1, max_value: int = 512):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        self.linear1 = nn.Linear(1, d_model)
-        self.activation = nn.ReLU()
-        self.linear2 = nn.Linear(d_model, d_model)
-        self.norm = nn.LayerNorm(d_model)
-        self.max_value = max_value
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = x.unsqueeze(-1)
-        x = torch.clamp(x, max=self.max_value)
-        x = self.activation(self.linear1(x))
-        x = self.linear2(x)
-        x = self.norm(x)
-        return self.dropout(x)
-
-
-class GeneEncoder(nn.Module):
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        padding_idx: Optional[int] = None,
-        nhead: int = 8,
-        use_perturbation_interaction: bool = False,
-        dropout: float = 0.1,
-        mask_path: str = None,
-        use_wire: bool = True,
-        wire_path: str = None,
-        grn_mask_path: str = None,
-        neighbor_cap: int = 128,
-    ):
-        super().__init__()
-        self.embedding = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
-        self.enc_norm = nn.LayerNorm(embedding_dim)
-        self.use_perturbation_interaction = use_perturbation_interaction
-        self.use_wire = use_wire
-        self.use_grn = grn_mask_path is not None and grn_mask_path != ''
-        self.neighbor_cap = neighbor_cap
-
-        if use_perturbation_interaction:
-            # Stored adjacency has True = NON-neighbor (~99% dense); real KNN are the
-            # False entries. Invert, drop self-loops, gather into a (vocab, cap) id table.
-            adj = ~torch.load(mask_path).bool()
-            adj.fill_diagonal_(False)
-            self.register_buffer('coexp_neighbors',
-                                 self._adjacency_to_neighbor_table(adj, neighbor_cap))
-
-            eigvec_dim = None
-            if use_wire and wire_path is not None:
-                eigvecs = torch.load(wire_path, weights_only=True).float()
-                self.register_buffer('spectral_coords', eigvecs)
-                eigvec_dim = eigvecs.shape[1]
-
-            self.coexp_attn = GeneNeighborAttention(
-                embedding_dim, nhead, mlp_ratio=4, dropout=dropout,
-                eigvec_dim=eigvec_dim, use_wire=(use_wire and eigvec_dim is not None),
-            )
-
-            if self.use_grn:
-                grn_raw = torch.load(grn_mask_path)
-                if grn_raw.dtype == torch.bool and grn_raw.dim() == 2 and grn_raw.shape[0] == grn_raw.shape[1]:
-                    g = grn_raw.clone()
-                    g.fill_diagonal_(False)
-                    grn_table = self._adjacency_to_neighbor_table(g, neighbor_cap)
-                else:
-                    grn_table = grn_raw.long()
-                self.register_buffer('grn_neighbors', grn_table)
-                self.grn_attn = GeneNeighborAttention(
-                    embedding_dim, nhead, mlp_ratio=4, dropout=dropout,
-                    eigvec_dim=None, use_wire=False,
-                )
-
-    @staticmethod
-    def _adjacency_to_neighbor_table(adj, k_max):
-        adj = adj.bool()
-        V = adj.shape[0]
-        table = torch.full((V, k_max), -1, dtype=torch.long)
-        for i in range(V):
-            idx = torch.nonzero(adj[i], as_tuple=False).reshape(-1)
-            if idx.numel() > k_max:
-                idx = idx[:k_max]
-            if idx.numel() > 0:
-                table[i, :idx.numel()] = idx
-        return table
-
-    def _gather_neighbors(self, gene_ids_row, table, with_coords):
-        nbr = table[gene_ids_row]                                    # (G, cap)
-        valid = nbr >= 0
-        nbr_c = nbr.clamp_min(0)
-        nbr_emb = self.enc_norm(self.embedding(nbr_c))               # (G, cap, d)
-        coords = None
-        if with_coords and hasattr(self, 'spectral_coords'):
-            coords = self.spectral_coords[nbr_c] * valid.unsqueeze(-1).to(self.spectral_coords.dtype)
-        return nbr_emb, valid, coords
-
-    def forward(self, x: Tensor) -> Tensor:
-        gene_ids = x
-        x = self.enc_norm(self.embedding(x))
-        if not self.use_perturbation_interaction:
-            return x
-
-        with_coords = self.use_wire and hasattr(self, 'spectral_coords')
-        coords_q = self.spectral_coords[gene_ids[0]] if with_coords else None
-
-        nbr_emb, valid, coords_nbr = self._gather_neighbors(
-            gene_ids[0], self.coexp_neighbors, with_coords=with_coords)
-        x = self.coexp_attn(x, nbr_emb, valid, coords_q, coords_nbr)
-
-        if self.use_grn:
-            grn_emb, grn_valid, _ = self._gather_neighbors(
-                gene_ids[0], self.grn_neighbors, with_coords=False)
-            x = self.grn_attn(x, grn_emb, grn_valid)
-        return x
 
 
 class BatchLabelEncoder(nn.Module):
@@ -235,27 +39,128 @@ class ExprDecoder(nn.Module):
         return dict(pred=pred_value, zero_probs=zero_probs)
 
 
-class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size, frequency_embedding_size=256):
+class GeneEncoder(nn.Module):
+    """
+    Gene embedding plus a fixed co-expression graph (neighbor table + manifold
+    coordinates) built once from mask_path / wire_path / grn_mask_path. The
+    graph is stored over the full vocabulary; local_graph() remaps it into
+    whatever gene subset a given forward call is using, so it works under
+    per-step gene subsampling without needing the graph rebuilt.
+
+    mask_path stores a boolean adjacency (True = NON-neighbor, as inverted
+    upstream) with no edge sign or strength, so edge_weight here is 1.0 for a
+    real neighbor and 0.0 otherwise. The neg_msg channel in VoidGeneBlock is
+    therefore always zero until a signed correlation cache is supplied instead
+    of the boolean mask.
+    """
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: Optional[int] = None,
+        use_perturbation_interaction: bool = False,
+        mask_path: str = None,
+        use_wire: bool = True,
+        wire_path: str = None,
+        grn_mask_path: str = None,
+        neighbor_cap: int = 128,
+        corr_path: str = None,
+    ):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.frequency_embedding_size = frequency_embedding_size
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
+        self.enc_norm = nn.LayerNorm(embedding_dim)
+        self.use_perturbation_interaction = use_perturbation_interaction
+        self.use_wire = use_wire and wire_path is not None
+        self.neighbor_cap = neighbor_cap
+        self.manifold_dim = 0
+
+        if use_perturbation_interaction:
+            adj = ~torch.load(mask_path).bool()
+            adj.fill_diagonal_(False)
+            neighbors = self._adjacency_to_neighbor_table(adj, neighbor_cap)
+
+            if grn_mask_path is not None and grn_mask_path != '':
+                grn_raw = torch.load(grn_mask_path)
+                if grn_raw.dtype == torch.bool and grn_raw.dim() == 2 and grn_raw.shape[0] == grn_raw.shape[1]:
+                    g = grn_raw.clone()
+                    g.fill_diagonal_(False)
+                    grn_neighbors = self._adjacency_to_neighbor_table(g, neighbor_cap)
+                else:
+                    grn_neighbors = grn_raw.long()
+                neighbors = self._merge_neighbor_tables(neighbors, grn_neighbors, neighbor_cap)
+
+            true_degree = int((neighbors >= 0).sum(dim=1).max().item())
+            neighbors = neighbors[:, :max(true_degree, 1)]
+            self.neighbor_cap = neighbors.shape[1]
+
+            valid = neighbors >= 0
+            if corr_path is not None and corr_path != '':
+                corr = torch.load(corr_path).float()
+                edge_corr = corr.gather(1, neighbors.clamp_min(0)) * valid.float()
+                edge_weight_pos = edge_corr.clamp_min(0.0)
+                edge_weight_neg = (-edge_corr).clamp_min(0.0)
+            else:
+                edge_weight_pos = valid.float()
+                edge_weight_neg = torch.zeros_like(edge_weight_pos)
+
+            self.register_buffer('neighbors', neighbors, persistent=True)
+            self.register_buffer('edge_weights_pos', edge_weight_pos, persistent=True)
+            self.register_buffer('edge_weights_neg', edge_weight_neg, persistent=True)
+
+        if self.use_wire:
+            eigvecs = torch.load(wire_path, weights_only=True).float()
+            self.manifold_dim = eigvecs.shape[1]
+            self.register_buffer('manifold_coords', eigvecs, persistent=True)
+            self.coord_embedding = nn.Sequential(
+                nn.Linear(self.manifold_dim, embedding_dim), nn.SiLU(), nn.Linear(embedding_dim, embedding_dim)
+            )
 
     @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
+    def _adjacency_to_neighbor_table(adj, k_max):
+        adj = adj.bool()
+        V = adj.shape[0]
+        table = torch.full((V, k_max), -1, dtype=torch.long)
+        for i in range(V):
+            idx = torch.nonzero(adj[i], as_tuple=False).reshape(-1)
+            if idx.numel() > k_max:
+                idx = idx[:k_max]
+            if idx.numel() > 0:
+                table[i, :idx.numel()] = idx
+        return table
 
-    def forward(self, t):
-        return self.mlp(self.timestep_embedding(t, self.frequency_embedding_size))
+    @staticmethod
+    def _merge_neighbor_tables(a, b, k_max):
+        V = a.shape[0]
+        merged = torch.full((V, k_max), -1, dtype=torch.long)
+        for i in range(V):
+            ids = torch.cat([a[i][a[i] >= 0], b[i][b[i] >= 0]])
+            ids = torch.unique(ids)[:k_max]
+            if ids.numel() > 0:
+                merged[i, :ids.numel()] = ids
+        return merged
+
+    def local_graph(self, gene_id_row: Tensor):
+        """Remap the full-vocab neighbor table into the local index space of the
+        current (possibly subsampled/permuted) gene_id_row. Returns
+        (local_neighbor_idx, local_edge_weight_pos, local_edge_weight_neg), each
+        shaped (G, neighbor_cap)."""
+        device = gene_id_row.device
+        g = gene_id_row.numel()
+        pos_table = torch.full((self.embedding.num_embeddings,), -1, dtype=torch.long, device=device)
+        pos_table[gene_id_row] = torch.arange(g, device=device)
+
+        abs_nbr = self.neighbors[gene_id_row]
+        valid = abs_nbr >= 0
+        local_nbr = pos_table[abs_nbr.clamp_min(0)]
+        valid = valid & (local_nbr >= 0)
+        local_nbr = local_nbr.clamp_min(0)
+        weight_pos = self.edge_weights_pos[gene_id_row] * valid.to(self.edge_weights_pos.dtype)
+        weight_neg = self.edge_weights_neg[gene_id_row] * valid.to(self.edge_weights_neg.dtype)
+        return local_nbr, weight_pos, weight_neg
+
+    def forward(self, x: Tensor) -> Tensor:
+        gene_emb = self.enc_norm(self.embedding(x))
+        if self.use_wire:
+            coords = self.manifold_coords[x]
+            gene_emb = gene_emb + self.coord_embedding(coords)
+        return gene_emb
