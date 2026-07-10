@@ -17,20 +17,37 @@ start=$(date +"%r, %m-%d-%Y")
 
 module load conda
 conda activate /depot/natallah/data/shourya/scDFM_env
-export PYTHONPATH=./
 export DEBUG_SYNC=${DEBUG_SYNC:-0}
 if [ "$DEBUG_SYNC" = "1" ]; then export CUDA_LAUNCH_BLOCKING=1; fi
 
-cd /depot/natallah/data/shourya/scDFM
+VOID_CELL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCDFM_ROOT=${SCDFM_ROOT:-/depot/natallah/data/shourya/scDFM}
+export PYTHONPATH="$VOID_CELL_DIR:$SCDFM_ROOT"
+
+cd "$SCDFM_ROOT"
+
+echo "VOID Cell source fingerprints"
+git -C "$VOID_CELL_DIR" rev-parse HEAD
+git -C "$VOID_CELL_DIR" status --short
+sha256sum \
+  "$VOID_CELL_DIR/config_flow.py" \
+  "$VOID_CELL_DIR/instantiate_model.py" \
+  "$VOID_CELL_DIR/layers.py" \
+  "$VOID_CELL_DIR/blocks.py" \
+  "$VOID_CELL_DIR/model.py" \
+  "$VOID_CELL_DIR/sampling.py" \
+  "$VOID_CELL_DIR/run.py"
 
 COMMON="--batch_size=48 --devices=0 --model_type=origin --lr=5e-5 --steps=300000 \
---data_name=norman --d_model=128 --eta_min=1e-6 --fusion_method=differential_perceiver \
+--data_name=norman --d_model=128 --d_hid=2048 --encode_blocks=4 --think_steps=8 \
+--eta_min=1e-6 --fusion_method=differential_perceiver --run_tag=void \
 --split_method=additive --infer_top_gene=1000 --n_top_genes=5000 --result_path=./result/additive \
 --perturbation_function=crisper --noise_type=Gaussian --mode=predict_y \
---deg_epsilon=0.1 --sinkhorn_eps=0.1 --sinkhorn_iters=50 \
---fold=1 --topk=30 --use_negative_edge --use_repo --use_wire"
+--endpoint_loss=deg_sinkhorn --gamma=0.1 --deg_epsilon=0.1 \
+--sinkhorn_eps=0.1 --sinkhorn_iters=50 \
+--fold=1 --topk=30 --use_negative_edge --use_signed_edges --use_repo --use_wire"
 
-python src/script/run.py $COMMON "$@"
+python -u "$VOID_CELL_DIR/run.py" $COMMON "$@"
 
 ends=$(date +"%s")
 end=$(date +"%r, %m-%d-%Y")

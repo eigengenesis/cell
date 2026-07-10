@@ -1,16 +1,24 @@
 import os
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+import hashlib
+import inspect
+from pathlib import Path
 import torch
 import torch.nn as nn
 import tyro
-from config.config_flow import FlowConfig as Config
+from config_flow import FlowConfig as Config
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import random
 from src.data_process.data import Data, PerturbationDataset
 from src.flow_matching.ot import OTPlanSampler
 from src.flow_matching.path import AffineProbPath
-from src.models.instantiate_model import instantiate_model
+from instantiate_model import instantiate_model
+from sampling import (
+    action_aware_gene_sample,
+    build_gene_column_lookup,
+    build_neighbor_column_table,
+)
 import tqdm
 from src.flow_matching.path.scheduler import CondOTScheduler
 from accelerate import Accelerator, DistributedDataParallelKwargs
@@ -27,6 +35,12 @@ from src.utils.utils import (save_checkpoint, load_checkpoint, make_lognorm_pois
 
 ot_sampler = OTPlanSampler(method="exact")
 path = AffineProbPath(scheduler=CondOTScheduler())
+
+
+def log_source_fingerprint(label, obj):
+    source_path = Path(inspect.getsourcefile(obj)).resolve()
+    digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    print(f"[source] {label} path={source_path} sha256={digest}", flush=True)
 
 
 def build_grn_neighbor_mask(edge_list, gene_name_to_token, ntoken, k):
@@ -144,11 +158,19 @@ def sinkhorn_divergence(X, Y, eps, n_iters, w=None):
 
 def train_step(source, target, perturbation_id, vf, accelerator,
                noise_type='Poisson', mode="predict_y", cfg_dropout=0.0,
-               deg_weights=None, condition_idx=None):
+               deg_weights=None, condition_idx=None,
+               gene_column_by_token=None, sampling_neighbor_columns=None):
     B = source.shape[0]
     device = accelerator.device
 
-    input_gene_ids = torch.randperm(source.shape[-1], device=device)[:config.infer_top_gene]
+    if gene_column_by_token is not None and sampling_neighbor_columns is not None:
+        input_gene_ids, target_count, mandatory_count, target_coverage = action_aware_gene_sample(
+            source.shape[-1], config.infer_top_gene, perturbation_id,
+            gene_column_by_token, sampling_neighbor_columns, device,
+        )
+    else:
+        input_gene_ids = torch.randperm(source.shape[-1], device=device)[:config.infer_top_gene]
+        target_count, mandatory_count, target_coverage = 0, 0, float('nan')
     source = source[:, input_gene_ids]
     target = target[:, input_gene_ids]
     gene = gene_ids.repeat(B, 1).to(device)
@@ -222,7 +244,12 @@ def train_step(source, target, perturbation_id, vf, accelerator,
         tgt = F.normalize(p_embed_gt.detach(), dim=-1)
         loss = 1 - (pred * tgt).sum(dim=-1).mean()
 
-    return loss
+    sampling_stats = {
+        'target_count': target_count,
+        'mandatory_count': mandatory_count,
+        'target_coverage': target_coverage,
+    }
+    return loss, sampling_stats
 
 
 def wrapped_vf(target, t, source, perturbation_id, vf, gene_ids, gene_all, perturbation_emb=None):
@@ -365,6 +392,12 @@ if __name__ == "__main__":
         print(config)
         save_path = config.make_path()
         os.makedirs(save_path, exist_ok=True)
+        log_source_fingerprint('run', train_step)
+        log_source_fingerprint('config', Config)
+        log_source_fingerprint('instantiate_model', instantiate_model)
+        log_source_fingerprint('sampling', action_aware_gene_sample)
+        log_source_fingerprint('scdfm_data', Data)
+        log_source_fingerprint('scdfm_dataset', PerturbationDataset)
     device = accelerator.device
 
     data_manager = Data('./data')
@@ -376,11 +409,13 @@ if __name__ == "__main__":
     )
     train_sampler, valid_sampler, test_dl = data_manager.load_flow_data(batch_size=config.batch_size)
 
-    train_dataset = PerturbationDataset(
-        train_sampler, config.batch_size,
-        cell_type_col='cell_type',
-        plate_col=config.plate_col if config.plate_col else None,
-    )
+    dataset_parameters = inspect.signature(PerturbationDataset).parameters
+    dataset_kwargs = {}
+    if 'cell_type_col' in dataset_parameters:
+        dataset_kwargs['cell_type_col'] = 'cell_type'
+    if 'plate_col' in dataset_parameters:
+        dataset_kwargs['plate_col'] = config.plate_col if config.plate_col else None
+    train_dataset = PerturbationDataset(train_sampler, config.batch_size, **dataset_kwargs)
     dataloader = DataLoader(train_dataset, batch_size=1, shuffle=False,
                             num_workers=8, pin_memory=True, persistent_workers=True)
 
@@ -456,9 +491,13 @@ if __name__ == "__main__":
         config.model_type,
         ntoken=len(vocab),
         d_model=config.d_model,
+        d_hid=config.d_hid,
+        encode_blocks=config.encode_blocks,
+        think_steps=config.think_steps,
         d_perturbation=config.d_model,
         fusion_method=config.fusion_method,
         perturbation_function=config.perturbation_function,
+        control_token_id=vocab.stoi.get('control'),
         mask_path=mask_path,
         wire_path=model_wire_path,
         use_wire=config.use_wire,
@@ -466,6 +505,28 @@ if __name__ == "__main__":
         grn_mask_path=grn_mask_path_arg,
         corr_path=corr_path_arg,
     )
+
+    gene_column_by_token = build_gene_column_lookup(gene_ids, len(vocab)).to(device)
+    sampling_neighbor_columns = build_neighbor_column_table(
+        mask_path=mask_path,
+        gene_token_ids=gene_ids,
+        vocab_size=len(vocab),
+        topk=config.topk,
+        corr_path=corr_path_arg,
+    ).to(device)
+    if accelerator.is_main_process:
+        log_source_fingerprint('model', type(vf))
+        print(
+            f"[model] params={sum(p.numel() for p in vf.parameters())} "
+            f"d_model={config.d_model} d_hid={config.d_hid} "
+            f"encode_blocks={config.encode_blocks} think_steps={config.think_steps}",
+            flush=True,
+        )
+        print(
+            f"[field] genes={config.infer_top_gene} target_neighbors={config.topk} "
+            "sampler=action_aware",
+            flush=True,
+        )
 
     save_path = config.make_path()
 
@@ -524,9 +585,13 @@ if __name__ == "__main__":
 
             set_requires_grad_for_p_only(vf, p_only=config.mode)
 
-            loss = train_step(source, target, perturbation_id, vf, accelerator,
-                              noise_type=config.noise_type, mode=config.mode, cfg_dropout=0.0, #cfg_dropout=0.02,
-                              deg_weights=deg_weights, condition_idx=condition_idx_raw)
+            loss, sampling_stats = train_step(
+                source, target, perturbation_id, vf, accelerator,
+                noise_type=config.noise_type, mode=config.mode, cfg_dropout=0.0,
+                deg_weights=deg_weights, condition_idx=condition_idx_raw,
+                gene_column_by_token=gene_column_by_token,
+                sampling_neighbor_columns=sampling_neighbor_columns,
+            )
 
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
@@ -544,6 +609,13 @@ if __name__ == "__main__":
                         iteration=iteration, eval_score=None, save_path=save_path_, is_best=False)
                 eval_score = test(valid_sampler, vf, accelerator,
                                   batch_size=config.batch_size, path=save_path_, vocab=vocab)
+
+            if accelerator.is_main_process and (iteration == start_iteration or iteration % 1000 == 0):
+                print(
+                    f"[field] iteration={iteration} target_coverage={sampling_stats['target_coverage']:.3f} "
+                    f"targets={sampling_stats['target_count']} mandatory_genes={sampling_stats['mandatory_count']}",
+                    flush=True,
+                )
 
             accelerator.wait_for_everyone()
             pbar.update(1)

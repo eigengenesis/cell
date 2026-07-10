@@ -1,22 +1,29 @@
-from src.models.scGPT.model import TransformerModel
-from src.models.perturbation.model import Model as FlowModel
-from src.models.perturbation.model import TimedTransformer
-from src.models.origin.model import model as OriginModel
 import torch
+
+try:
+    from .model import model as OriginModel
+except ImportError:
+    from model import model as OriginModel
+
 def instantiate_model(model_type: str, **kwargs):
     if model_type == 'origin':
-        if kwargs['fusion_method'] == 'differential_transformer':
-            layers = 8
-        elif kwargs['fusion_method'] == 'differential_perceiver':
-            layers = 4
-        else:
-            layers = 8
+        layers = kwargs.get('encode_blocks')
+        if layers is None:
+            if kwargs['fusion_method'] == 'differential_transformer':
+                layers = 8
+            elif kwargs['fusion_method'] == 'differential_perceiver':
+                layers = 4
+            else:
+                layers = 8
         m = OriginModel(
             ntoken=kwargs['ntoken'],
             d_model=kwargs['d_model'],
+            d_hid=kwargs.get('d_hid', 2048),
             fusion_method=kwargs['fusion_method'],
             nlayers=layers,
+            think_steps=kwargs.get('think_steps', 8),
             perturbation_function=kwargs['perturbation_function'],
+            control_token_id=kwargs.get('control_token_id'),
             mask_path=kwargs['mask_path'],
             wire_path=kwargs.get('wire_path', None),
             use_wire=kwargs.get('use_wire', False),

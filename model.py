@@ -3,8 +3,12 @@ import torch.nn as nn
 from torch import Tensor
 from typing import Optional
 
-from .layers import GeneEncoder, BatchLabelEncoder, ExprDecoder
-from .blocks import ValueEncoder, TimestepEmbedder, VoidGeneBlock
+try:
+    from .layers import GeneEncoder, BatchLabelEncoder, ExprDecoder
+    from .blocks import ValueEncoder, TimestepEmbedder, VoidGeneBlock
+except ImportError:
+    from layers import GeneEncoder, BatchLabelEncoder, ExprDecoder
+    from blocks import ValueEncoder, TimestepEmbedder, VoidGeneBlock
 
 
 class model(nn.Module):
@@ -28,10 +32,12 @@ class model(nn.Module):
                  residual_scale: float = 0.1,
                  neighbor_cap: int = 128,
                  neighbor_gate: bool = True,
+                 control_token_id: int | None = None,
                  **kwargs):
         super().__init__()
         self.perturbation_function = perturbation_function
         self.think_steps = int(think_steps)
+        self.control_token_id = control_token_id
 
         self.encoder = GeneEncoder(
             ntoken, d_model,
@@ -48,6 +54,12 @@ class model(nn.Module):
 
         self.condition_fusion = nn.Sequential(
             nn.Linear(2 * d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
+        )
+        self.action_phi = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
+        )
+        self.action_rho = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
         )
         self.input_fusion = nn.Sequential(
             nn.Linear(3 * d_model, d_model), nn.GELU(),
@@ -87,8 +99,31 @@ class model(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
+        for block in [*self.encode, self.ghost]:
+            block.reset_void_parameters()
         nn.init.trunc_normal_(self.action_projection.weight, std=1e-2)
         nn.init.constant_(self.velocity_gate[-1].bias, -2.0)
+
+    def compose_perturbation(self, perturbation_id=None, perturbation_emb=None, cell_1=None):
+        if perturbation_id is None:
+            global_action = self.get_perturbation_emb(
+                perturbation_id=None, perturbation_emb=perturbation_emb, cell_1=cell_1
+            )
+            return global_action, None, None
+
+        if self.perturbation_function != 'crisper':
+            components = self.perturbation_embedder(perturbation_id)
+            valid = torch.ones(components.shape[:2], device=components.device, dtype=torch.bool)
+        else:
+            components = self.encoder(perturbation_id)
+            valid = torch.ones(components.shape[:2], device=components.device, dtype=torch.bool)
+            if self.control_token_id is not None:
+                valid = perturbation_id.ne(int(self.control_token_id))
+
+        encoded = self.action_phi(components) * valid.unsqueeze(-1).to(components.dtype)
+        global_action = self.action_rho(encoded.sum(dim=1))
+        global_action = global_action * valid.any(dim=1, keepdim=True).to(global_action.dtype)
+        return global_action, components, valid
 
     def get_perturbation_emb(self, perturbation_id=None, perturbation_emb=None,
                              cell_1=None, use_mask: bool = False):
@@ -134,6 +169,21 @@ class model(nn.Module):
             gate.clamp_(0.0, 1.0)
         return gate
 
+    def local_action_field(self, perturbation_id, components, valid, gene_id_row, b, g, dtype):
+        if self.perturbation_function != 'crisper' or perturbation_id is None or components is None:
+            return None
+        vocab_size = self.encoder.embedding.num_embeddings
+        pos_table = torch.full((vocab_size,), -1, dtype=torch.long, device=gene_id_row.device)
+        pos_table[gene_id_row] = torch.arange(g, device=gene_id_row.device)
+        local = pos_table[perturbation_id.clamp(0, vocab_size - 1)]
+        active = valid & (local >= 0)
+        action_components = self.action_vector(components).to(dtype=dtype)
+        field = torch.zeros((b, g, action_components.size(-1)), device=gene_id_row.device, dtype=dtype)
+        if active.any():
+            scatter_idx = local.clamp_min(0).unsqueeze(-1).expand_as(action_components)
+            field.scatter_add_(1, scatter_idx, action_components * active.unsqueeze(-1).to(dtype))
+        return field
+
     @staticmethod
     def _build_adjacency(local_nbr: Tensor, edge_weight_pos: Tensor, edge_weight_neg: Tensor,
                          eps: float = 1e-6):
@@ -159,6 +209,13 @@ class model(nn.Module):
         neg_msg = torch.matmul(adj_neg, x_flat).reshape(G, B, d).permute(1, 0, 2)
         return pos_msg, neg_msg
 
+    @staticmethod
+    def apply_ghost_update(x, global_state, ghost_x, global_input,
+                           cand_x, cand_global, ghost_gate):
+        x = x + ghost_gate * (cand_x - ghost_x)
+        global_state = global_state + ghost_gate * (cand_global - global_input)
+        return x, global_state
+
     def forward(self, gene_id, cell_1, t, cell_2, perturbation_id=None, gene_id_all=None,
                     perturbation_emb=None, mode="predict_y"):
         with torch.autocast(device_type=cell_1.device.type, dtype=torch.bfloat16):
@@ -178,18 +235,19 @@ class model(nn.Module):
         value_x = self.value_current(cell_1)
         value_c = self.value_control(cell_2)
 
-        perturbation_emb = self.get_perturbation_emb(perturbation_id, perturbation_emb, cell_1)
+        perturbation_emb, action_components, action_valid = self.compose_perturbation(
+            perturbation_id, perturbation_emb, cell_1
+        )
         t_emb = self.t_embedder(t)
         cond = self.condition_fusion(torch.cat([t_emb, perturbation_emb], dim=-1))
 
         x = self.input_fusion(torch.cat([gene_emb, value_x, value_c], dim=-1))
 
-        gate = self.target_gene_gate(perturbation_id, gene_row, B, G, device, x.dtype)
         broadcast = perturbation_emb[:, None, :].expand(-1, G, -1)
-        if gate is not None:
-            action = gate.unsqueeze(-1) * self.action_vector(perturbation_emb)[:, None, :] + broadcast
-        else:
-            action = broadcast
+        local_action = self.local_action_field(
+            perturbation_id, action_components, action_valid, gene_row, B, G, x.dtype
+        )
+        action = broadcast if local_action is None else broadcast + local_action
         x = x + self.action_projection(action)
 
         global_state = x.mean(dim=1)
@@ -221,8 +279,10 @@ class model(nn.Module):
                 ghost_x, global_state + global_init, pos_msg, neg_msg, cond, source_state,
                 cache=ghost_cache,
             )
-            x = x + ghost_gate * (cand_x - x)
-            global_state = global_state + ghost_gate * (cand_global - global_state)
+            global_input = global_state + global_init
+            x, global_state = self.apply_ghost_update(
+                x, global_state, ghost_x, global_input, cand_x, cand_global, ghost_gate
+            )
 
         x = self.out_norm(x)
 

@@ -1,5 +1,29 @@
 # VOID Cell
 
+## H100 VOID 300k Run
+
+The canonical Norman additive run is now fully specified in `train.sbatch`.
+It executes this directory's `run.py`, `model.py`, `blocks.py`, `layers.py`,
+`sampling.py`, `instantiate_model.py`, and `config_flow.py` directly while
+reusing the surrounding scDFM data and flow utilities. Every source path and
+SHA256 hash is written to the Slurm log.
+
+Submit the single final run from this directory:
+
+```bash
+bash submit_sweep.sh
+```
+
+The run uses Adam, Gaussian flow, DEG-Sinkhorn, signed negative edges, wire
+geometry, 1,000 field genes, `d_model=128`, `d_hid=2048`, four encode blocks,
+eight ghost steps, and Norman additive fold 1 for 300,000 steps. Its output path
+contains `tag_void`, so it cannot auto-resume an older architecture.
+
+This run also guarantees that every training field contains the perturbation
+targets and their top-30 graph neighbors, composes double perturbations with
+separate local actions and an order-invariant global action, preserves zero
+AdaLN initialization, and removes unconditional ghost-state amplification.
+
 Standalone VOID-style Perturb-seq trainer for virtual cell perturbation. This is
 not a wrapper around `scDFM`: it trains directly from AnnData expression matrices
 using gene columns, perturbation IDs, a signed coexpression graph, and a spectral

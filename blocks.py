@@ -233,7 +233,13 @@ class VoidGeneBlock(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.act = nn.GELU()
 
-        for layer in contract_layers:
+        self._contract_layers = contract_layers
+        self.reset_void_parameters()
+
+    def reset_void_parameters(self):
+        nn.init.zeros_(self.ada.net[-1].weight)
+        nn.init.zeros_(self.ada.net[-1].bias)
+        for layer in self._contract_layers:
             nn.init.trunc_normal_(layer.weight, std=0.02)
         nn.init.trunc_normal_(self.expand.weight, std=0.01)
 
