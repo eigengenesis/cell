@@ -2,7 +2,9 @@ import os
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 import hashlib
 import inspect
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 import torch
 import torch.nn as nn
 import tyro
@@ -35,6 +37,36 @@ from src.models.origin.sampling import (
 ot_sampler = OTPlanSampler(method="exact")
 path = AffineProbPath(scheduler=CondOTScheduler())
 _SINKHORN_NONFINITE_COUNT = 0
+
+
+@dataclass
+class RunConfig(Config):
+    """Local optimizer controls without requiring changes to scDFM's config."""
+
+    optimizer: Literal["adam", "muon", "aurora"] = "adam"
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_eps: float = 1e-8
+    muon_lr: float = 0.02
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
+    muon_nesterov: bool = True
+    aurora_lr: float = 0.05
+    aurora_momentum: float = 0.95
+    aurora_pp_iterations: int = 2
+    aurora_pp_beta: float = 0.5
+    aurora_nesterov: bool = True
+    orthogonal_weight_decay: float = 0.025
+
+    def make_path(self):
+        base = super().make_path()
+        if self.optimizer == "adam":
+            return base
+        if self.optimizer == "muon":
+            detail = f"lr_{self.muon_lr:g}-ns_{self.muon_ns_steps}"
+        else:
+            detail = f"lr_{self.aurora_lr:g}-pp_{self.aurora_pp_iterations}"
+        return f"{base}-optimizer_{self.optimizer}-{detail}"
 
 def log_source_fingerprint(label, obj):
     source_path = Path(inspect.getsourcefile(obj)).resolve()
@@ -394,8 +426,250 @@ def find_latest_checkpoint(save_path: str) -> str | None:
         return None
     return max(candidates, key=lambda x: x[0])[1]
 
+
+@torch.no_grad()
+def muon_zeropower(g: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """Muon's quintic Newton-Schulz orthogonalization for a 2D update."""
+    if g.ndim != 2:
+        raise ValueError(f"Muon expects a matrix, got shape {tuple(g.shape)}")
+    original_dtype = g.dtype
+    x = g.bfloat16() if g.is_cuda and torch.cuda.is_bf16_supported() else g.float()
+    x = x / (x.norm() + eps)
+    transposed = x.size(0) > x.size(1)
+    if transposed:
+        x = x.T
+    a, b, c = 3.4445, -4.7750, 2.0315
+    for _ in range(max(int(steps), 1)):
+        aa = x @ x.T
+        x = a * x + (b * aa + c * (aa @ aa)) @ x
+    if transposed:
+        x = x.T
+    return x.to(original_dtype)
+
+
+@torch.no_grad()
+def aurora_polar(g: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """Official Aurora CANS-12 FP32 approximation of the polar factor."""
+    if g.ndim != 2:
+        raise ValueError(f"Aurora expects a matrix, got shape {tuple(g.shape)}")
+    x = g.float()
+    transposed = x.size(0) > x.size(1)
+    if transposed:
+        x = x.T
+    x = x / (x.norm() + eps)
+    coefficients = (
+        (5.182503604966906, -5.178098480082684),
+        (2.586120737395915, -0.6479542005271643),
+        (2.567364126726186, -0.6454968804392178),
+        (2.520560084348265, -0.6393528082067044),
+        (2.410759275435182, -0.6248683598710716),
+        (2.1883348130094173, -0.5952022073798908),
+        (1.8595760874873613, -0.5504490972723968),
+        (1.589020160467417, -0.5126569802066718),
+        (1.5051653981684994, -0.5007377068751799),
+        (1.5, -0.5),
+        (1.5, -0.5),
+        (1.5, -0.5),
+    )
+    for a, b in coefficients:
+        aa = x @ x.T
+        x = a * x + b * aa @ x
+    if transposed:
+        x = x.T
+    return x
+
+
+def use_orthogonal_optimizer(name: str, param: torch.nn.Parameter) -> bool:
+    """Keep embeddings, normalization, and prediction heads on AdamW."""
+    if param.ndim != 2:
+        return False
+    lowered = name.lower()
+    adamw_only = (
+        "embedding",
+        "norm",
+        "bias",
+        "final_layer",
+        "velocity_gate",
+        "p_head",
+    )
+    return not any(token in lowered for token in adamw_only)
+
+
+class HybridOrthogonalAdamW(torch.optim.Optimizer):
+    """Muon/Aurora for hidden matrices and AdamW for remaining parameters."""
+
+    def __init__(self, param_groups):
+        super().__init__(param_groups, {})
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            algorithm = group["algorithm"]
+            if algorithm == "muon":
+                self._orthogonal_step(group, use_aurora=False)
+            elif algorithm == "aurora":
+                self._orthogonal_step(group, use_aurora=True)
+            elif algorithm == "adamw":
+                self._adamw_step(group)
+            else:
+                raise RuntimeError(f"Unknown optimizer group: {algorithm}")
+        return loss
+
+    def _orthogonal_step(self, group, use_aurora: bool):
+        lr = group["lr"]
+        momentum = group["momentum"]
+        weight_decay = group["weight_decay"]
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            if p.grad.is_sparse:
+                raise RuntimeError("Muon and Aurora do not support sparse gradients.")
+            grad = p.grad
+            state = self.state[p]
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = torch.zeros_like(p)
+            buf = state["momentum_buffer"]
+            buf.lerp_(grad, 1.0 - momentum)
+            update = grad.lerp(buf, momentum) if group["nesterov"] else buf
+
+            if use_aurora:
+                rows, cols = update.shape
+                if rows <= cols:
+                    update = aurora_polar(update, eps=group["eps"])
+                else:
+                    update32 = update.float()
+                    target_row_sq = float(cols) / float(rows)
+                    row_norm = update32.norm(dim=-1, keepdim=True).clamp_min(group["eps"])
+                    diagonal = row_norm.reciprocal()
+                    for iteration in range(group["pp_iterations"]):
+                        projected = aurora_polar(diagonal * update32, eps=group["eps"])
+                        if iteration < group["pp_iterations"] - 1:
+                            row_sq = projected.float().pow(2).sum(dim=-1, keepdim=True)
+                            row_sq = row_sq.clamp_min(group["eps"] ** 2)
+                            diagonal = diagonal * (target_row_sq / row_sq).pow(group["pp_beta"])
+                    update = projected
+            else:
+                update = muon_zeropower(update, steps=group["ns_steps"], eps=group["eps"])
+
+            rows, cols = p.shape
+            update = update * math.sqrt(max(1.0, float(rows) / float(cols)))
+            if not torch.isfinite(update).all():
+                raise RuntimeError(
+                    f"{group['algorithm']} produced a non-finite update for {tuple(p.shape)}"
+                )
+            if weight_decay:
+                p.mul_(1.0 - lr * weight_decay)
+            p.add_(update.to(p.dtype), alpha=-lr)
+
+    def _adamw_step(self, group):
+        lr = group["lr"]
+        beta1, beta2 = group["betas"]
+        eps = group["eps"]
+        weight_decay = group["weight_decay"]
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            if p.grad.is_sparse:
+                raise RuntimeError("AdamW does not support sparse gradients.")
+            if weight_decay:
+                p.mul_(1.0 - lr * weight_decay)
+            grad = p.grad
+            state = self.state[p]
+            if not state:
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(p)
+                state["exp_avg_sq"] = torch.zeros_like(p)
+            state["step"] += 1
+            exp_avg = state["exp_avg"]
+            exp_avg_sq = state["exp_avg_sq"]
+            exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+            correction1 = 1.0 - beta1 ** state["step"]
+            correction2 = 1.0 - beta2 ** state["step"]
+            denom = exp_avg_sq.sqrt().div_(math.sqrt(correction2)).add_(eps)
+            p.addcdiv_(exp_avg, denom, value=-lr / correction1)
+
+
+def build_optimizer(model: nn.Module, cfg: RunConfig):
+    if cfg.optimizer == "adam":
+        return torch.optim.Adam(
+            model.parameters(),
+            lr=cfg.lr,
+            betas=(cfg.adam_beta1, cfg.adam_beta2),
+            eps=cfg.adam_eps,
+        )
+
+    orthogonal_params = []
+    adamw_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        destination = orthogonal_params if use_orthogonal_optimizer(name, param) else adamw_params
+        destination.append(param)
+
+    orthogonal_lr = cfg.muon_lr if cfg.optimizer == "muon" else cfg.aurora_lr
+    orthogonal_momentum = (
+        cfg.muon_momentum if cfg.optimizer == "muon" else cfg.aurora_momentum
+    )
+    orthogonal_nesterov = (
+        cfg.muon_nesterov if cfg.optimizer == "muon" else cfg.aurora_nesterov
+    )
+    groups = [
+        {
+            "params": orthogonal_params,
+            "algorithm": cfg.optimizer,
+            "name": cfg.optimizer,
+            "lr": orthogonal_lr,
+            "momentum": orthogonal_momentum,
+            "nesterov": orthogonal_nesterov,
+            "weight_decay": cfg.orthogonal_weight_decay,
+            "eps": 1e-7,
+            "ns_steps": cfg.muon_ns_steps,
+            "pp_iterations": cfg.aurora_pp_iterations,
+            "pp_beta": cfg.aurora_pp_beta,
+        },
+        {
+            "params": adamw_params,
+            "algorithm": "adamw",
+            "name": "adamw",
+            "lr": cfg.lr,
+            "betas": (cfg.adam_beta1, cfg.adam_beta2),
+            "eps": cfg.adam_eps,
+            "weight_decay": cfg.orthogonal_weight_decay,
+        },
+    ]
+    return HybridOrthogonalAdamW([group for group in groups if group["params"]])
+
+
+def build_scheduler(optimizer, cfg: RunConfig):
+    if cfg.optimizer == "adam":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg.steps, eta_min=cfg.eta_min
+        )
+    min_ratio = min(max(cfg.eta_min / max(cfg.lr, 1e-12), 0.0), 1.0)
+
+    def cosine_multiplier(step):
+        progress = min(max(float(step) / max(float(cfg.steps), 1.0), 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_ratio + (1.0 - min_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_multiplier)
+
+
+def optimizer_summary(optimizer) -> str:
+    details = []
+    for index, group in enumerate(optimizer.param_groups):
+        count = sum(param.numel() for param in group["params"])
+        name = group.get("name", f"group{index}")
+        details.append(f"{name}:params={count},lr={group['lr']:.3g}")
+    return " | ".join(details)
+
 if __name__ == "__main__":
-    config = tyro.cli(Config)
+    config = tyro.cli(RunConfig)
     torch.set_float32_matmul_precision("high")
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     # accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
@@ -414,7 +688,7 @@ if __name__ == "__main__":
         save_path = config.make_path()
         os.makedirs(save_path, exist_ok=True)
         log_source_fingerprint('run', train_step)
-        log_source_fingerprint('config', Config)
+        log_source_fingerprint('config', RunConfig)
         log_source_fingerprint('instantiate_model', instantiate_model)
         log_source_fingerprint('sampling', action_aware_gene_sample)
         log_source_fingerprint('scdfm_data', Data)
@@ -553,8 +827,10 @@ if __name__ == "__main__":
 
     save_path = config.make_path()
 
-    optimizer = torch.optim.Adam(vf.parameters(), lr=config.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.steps, eta_min=config.eta_min)
+    optimizer = build_optimizer(vf, config)
+    scheduler = build_scheduler(optimizer, config)
+    if accelerator.is_main_process:
+        print(f"[optimizer] type={config.optimizer} | {optimizer_summary(optimizer)}", flush=True)
 
     if config.checkpoint_path == '':
         config.checkpoint_path = find_latest_checkpoint(save_path) or ''
