@@ -43,7 +43,7 @@ _SINKHORN_NONFINITE_COUNT = 0
 class RunConfig(Config):
     """Local optimizer controls without requiring changes to scDFM's config."""
 
-    optimizer: Literal["adam", "muon", "aurora"] = "adam"
+    optimizer: Literal["adam", "muon", "normuon_tall", "aurora"] = "adam"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_eps: float = 1e-8
@@ -51,6 +51,10 @@ class RunConfig(Config):
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
     muon_nesterov: bool = True
+    normuon_lr: float = 0.035
+    normuon_momentum: float = 0.95
+    normuon_beta2: float = 0.95
+    normuon_eps: float = 1e-8
     aurora_lr: float = 0.05
     aurora_momentum: float = 0.95
     aurora_pp_iterations: int = 2
@@ -64,6 +68,8 @@ class RunConfig(Config):
             return base
         if self.optimizer == "muon":
             detail = f"lr_{self.muon_lr:g}-ns_{self.muon_ns_steps}"
+        elif self.optimizer == "normuon_tall":
+            detail = f"lr_{self.normuon_lr:g}-beta2_{self.normuon_beta2:g}"
         else:
             detail = f"lr_{self.aurora_lr:g}-pp_{self.aurora_pp_iterations}"
         return f"{base}-optimizer_{self.optimizer}-{detail}"
@@ -511,6 +517,8 @@ class HybridOrthogonalAdamW(torch.optim.Optimizer):
             algorithm = group["algorithm"]
             if algorithm == "muon":
                 self._orthogonal_step(group, use_aurora=False)
+            elif algorithm == "normuon_tall":
+                self._normuon_tall_step(group)
             elif algorithm == "aurora":
                 self._orthogonal_step(group, use_aurora=True)
             elif algorithm == "adamw":
@@ -565,6 +573,53 @@ class HybridOrthogonalAdamW(torch.optim.Optimizer):
                 p.mul_(1.0 - lr * weight_decay)
             p.add_(update.to(p.dtype), alpha=-lr)
 
+    def _normuon_tall_step(self, group):
+        """Aurora-paper NorMuon normalization, restricted to tall matrices."""
+        lr = group["lr"]
+        beta1 = group["momentum"]
+        beta2 = group["beta2"]
+        eps = group["eps"]
+        weight_decay = group["weight_decay"]
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            if p.grad.is_sparse:
+                raise RuntimeError("NorMuon does not support sparse gradients.")
+            grad = p.grad
+            state = self.state[p]
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = torch.zeros_like(p)
+            momentum = state["momentum_buffer"]
+            momentum.lerp_(grad, 1.0 - beta1)
+            polar = muon_zeropower(momentum, steps=group["ns_steps"], eps=eps)
+            rows, cols = p.shape
+
+            if rows > cols:
+                if "row_second_moment" not in state:
+                    state["row_second_moment"] = torch.zeros(
+                        rows, dtype=torch.float32, device=p.device
+                    )
+                row_second_moment = state["row_second_moment"]
+                row_energy = polar.float().square().mean(dim=1)
+                row_second_moment.lerp_(row_energy, 1.0 - beta2)
+                normalized = polar.float() / (row_second_moment.sqrt().unsqueeze(1) + eps)
+                step_scale = (
+                    0.2 * lr * math.sqrt(float(rows * cols))
+                    / (normalized.norm() + eps)
+                )
+                update = normalized.to(p.dtype) * step_scale.to(p.dtype)
+            else:
+                # Precise polar factors already have uniform rows when rows <= columns.
+                update = polar * math.sqrt(max(1.0, float(rows) / float(cols))) * lr
+
+            if not torch.isfinite(update).all():
+                raise RuntimeError(
+                    f"normuon_tall produced a non-finite update for {tuple(p.shape)}"
+                )
+            if weight_decay:
+                p.mul_(1.0 - lr * weight_decay)
+            p.sub_(update)
+
     def _adamw_step(self, group):
         lr = group["lr"]
         beta1, beta2 = group["betas"]
@@ -611,13 +666,18 @@ def build_optimizer(model: nn.Module, cfg: RunConfig):
         destination = orthogonal_params if use_orthogonal_optimizer(name, param) else adamw_params
         destination.append(param)
 
-    orthogonal_lr = cfg.muon_lr if cfg.optimizer == "muon" else cfg.aurora_lr
-    orthogonal_momentum = (
-        cfg.muon_momentum if cfg.optimizer == "muon" else cfg.aurora_momentum
-    )
-    orthogonal_nesterov = (
-        cfg.muon_nesterov if cfg.optimizer == "muon" else cfg.aurora_nesterov
-    )
+    if cfg.optimizer == "muon":
+        orthogonal_lr = cfg.muon_lr
+        orthogonal_momentum = cfg.muon_momentum
+        orthogonal_nesterov = cfg.muon_nesterov
+    elif cfg.optimizer == "normuon_tall":
+        orthogonal_lr = cfg.normuon_lr
+        orthogonal_momentum = cfg.normuon_momentum
+        orthogonal_nesterov = False
+    else:
+        orthogonal_lr = cfg.aurora_lr
+        orthogonal_momentum = cfg.aurora_momentum
+        orthogonal_nesterov = cfg.aurora_nesterov
     groups = [
         {
             "params": orthogonal_params,
@@ -627,8 +687,9 @@ def build_optimizer(model: nn.Module, cfg: RunConfig):
             "momentum": orthogonal_momentum,
             "nesterov": orthogonal_nesterov,
             "weight_decay": cfg.orthogonal_weight_decay,
-            "eps": 1e-7,
+            "eps": cfg.normuon_eps if cfg.optimizer == "normuon_tall" else 1e-7,
             "ns_steps": cfg.muon_ns_steps,
+            "beta2": cfg.normuon_beta2,
             "pp_iterations": cfg.aurora_pp_iterations,
             "pp_beta": cfg.aurora_pp_beta,
         },
