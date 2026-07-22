@@ -46,29 +46,38 @@ def action_aware_gene_sample(
     device: torch.device,
 ) -> tuple[torch.Tensor, int, int, float]:
     n_select = min(int(n_select), int(n_genes))
-    tokens = torch.unique(perturbation_ids.detach().reshape(-1).long())
+    tokens = torch.unique(perturbation_ids.detach().reshape(-1).long()).cpu()
     tokens = tokens[(tokens >= 0) & (tokens < gene_column_by_token.numel())]
 
-    target_columns = gene_column_by_token[tokens]
-    target_columns = target_columns[target_columns >= 0]
+    all_target_columns = gene_column_by_token[tokens]
+    all_target_columns = torch.unique(all_target_columns[all_target_columns >= 0])
+
+    target_columns = all_target_columns
+    if target_columns.numel() > n_select:
+        perm = torch.randperm(target_columns.numel())
+        target_columns = target_columns[perm[:n_select]]
+
     neighbors = neighbor_columns[tokens].reshape(-1) if tokens.numel() else torch.empty(0, dtype=torch.long)
-    neighbors = neighbors[neighbors >= 0]
-    target_columns = torch.unique(target_columns)
-    neighbors = torch.unique(neighbors)
+    neighbors = torch.unique(neighbors[neighbors >= 0])
     if target_columns.numel():
         neighbors = neighbors[~torch.isin(neighbors, target_columns)]
     neighbor_budget = max(n_select - target_columns.numel(), 0)
-    mandatory = torch.cat([target_columns, neighbors[:neighbor_budget]]).to(device=device)
+    if neighbors.numel() > neighbor_budget:
+        perm = torch.randperm(neighbors.numel())
+        neighbors = neighbors[perm[:neighbor_budget]]
 
+    mandatory = torch.cat([target_columns, neighbors]).to(device=device)
     available = torch.ones(int(n_genes), dtype=torch.bool, device=device)
     available[mandatory] = False
     random_columns = torch.randperm(int(n_genes), device=device)
-    random_columns = random_columns[available[random_columns]][: n_select - mandatory.numel()]
+    random_budget = max(n_select - mandatory.numel(), 0)
+    random_columns = random_columns[available[random_columns]][:random_budget]
     selected = torch.cat([mandatory, random_columns])
     selected = selected[torch.randperm(selected.numel(), device=device)]
-    target_columns = target_columns.to(device=device)
-    if target_columns.numel():
-        covered = torch.isin(target_columns, selected).float().mean().item()
-    else:
-        covered = 1.0
-    return selected, int(target_columns.numel()), int(mandatory.numel()), float(covered)
+
+    all_target_columns = all_target_columns.to(device=device)
+    covered = (
+        torch.isin(all_target_columns, selected).float().mean().item()
+        if all_target_columns.numel() else 1.0
+    )
+    return selected, int(all_target_columns.numel()), int(mandatory.numel()), float(covered)

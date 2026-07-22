@@ -6,19 +6,14 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import tyro
-from config_flow import FlowConfig as Config
+from config.config_flow import FlowConfig as Config
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import random
 from src.data_process.data import Data, PerturbationDataset
 from src.flow_matching.ot import OTPlanSampler
 from src.flow_matching.path import AffineProbPath
-from instantiate_model import instantiate_model
-from sampling import (
-    action_aware_gene_sample,
-    build_gene_column_lookup,
-    build_neighbor_column_table,
-)
+from src.models.instantiate_model import instantiate_model
 import tqdm
 from src.flow_matching.path.scheduler import CondOTScheduler
 from accelerate import Accelerator, DistributedDataParallelKwargs
@@ -32,10 +27,14 @@ import math
 import re
 from src.utils.utils import (save_checkpoint, load_checkpoint, make_lognorm_poisson_noise,
                               pick_eval_score, process_vocab, set_requires_grad_for_p_only)
-
+from src.models.origin.sampling import (
+    action_aware_gene_sample,
+    build_gene_column_lookup,
+    build_neighbor_column_table,
+)
 ot_sampler = OTPlanSampler(method="exact")
 path = AffineProbPath(scheduler=CondOTScheduler())
-
+_SINKHORN_NONFINITE_COUNT = 0
 
 def log_source_fingerprint(label, obj):
     source_path = Path(inspect.getsourcefile(obj)).resolve()
@@ -134,11 +133,14 @@ def compute_deg_weights(train_sampler, epsilon=0.1):
 def weighted_sqdist(X, Y, w=None):
     if w is None:
         return torch.cdist(X, Y, p=2) ** 2
-    s = w.clamp_min(0).sqrt()
+    total = w.clamp_min(0).sum().clamp_min(1e-12)
+    s = (w.clamp_min(0) / total).sqrt()
     return torch.cdist(X * s, Y * s, p=2) ** 2
 
 
 def sinkhorn_value(C, eps, n_iters):
+    C = C.float()
+    eps = float(eps)
     m, n = C.shape
     log_a = torch.full((m,), -math.log(m), device=C.device, dtype=C.dtype)
     log_b = torch.full((n,), -math.log(n), device=C.device, dtype=C.dtype)
@@ -151,26 +153,30 @@ def sinkhorn_value(C, eps, n_iters):
 
 
 def sinkhorn_divergence(X, Y, eps, n_iters, w=None):
+    X = X.float()
+    Y = Y.float()
+    if w is not None:
+        w = w.float()
     return (sinkhorn_value(weighted_sqdist(X, Y, w), eps, n_iters)
             - 0.5 * sinkhorn_value(weighted_sqdist(X, X, w), eps, n_iters)
             - 0.5 * sinkhorn_value(weighted_sqdist(Y, Y, w), eps, n_iters))
 
 
-def train_step(source, target, perturbation_id, vf, accelerator,
+def train_step(source, target, perturbation_id, vf, accelerator, iteration=0,
                noise_type='Poisson', mode="predict_y", cfg_dropout=0.0,
                deg_weights=None, condition_idx=None,
                gene_column_by_token=None, sampling_neighbor_columns=None):
     B = source.shape[0]
     device = accelerator.device
 
-    if gene_column_by_token is not None and sampling_neighbor_columns is not None:
-        input_gene_ids, target_count, mandatory_count, target_coverage = action_aware_gene_sample(
-            source.shape[-1], config.infer_top_gene, perturbation_id,
-            gene_column_by_token, sampling_neighbor_columns, device,
-        )
-    else:
-        input_gene_ids = torch.randperm(source.shape[-1], device=device)[:config.infer_top_gene]
-        target_count, mandatory_count, target_coverage = 0, 0, float('nan')
+    input_gene_ids, target_count, mandatory_count, target_coverage = action_aware_gene_sample(
+        n_genes=source.shape[-1],
+        n_select=config.infer_top_gene,
+        perturbation_ids=perturbation_id,
+        gene_column_by_token=gene_column_by_token,
+        neighbor_columns=sampling_neighbor_columns,
+        device=device,
+    )
     source = source[:, input_gene_ids]
     target = target[:, input_gene_ids]
     gene = gene_ids.repeat(B, 1).to(device)
@@ -224,16 +230,32 @@ def train_step(source, target, perturbation_id, vf, accelerator,
             elif endpoint_type in ('sinkhorn', 'deg_sinkhorn'):
                 eps_scale = getattr(config, 'sinkhorn_eps', 0.1)
                 n_iters = getattr(config, 'sinkhorn_iters', 50)
+                x1_hat_f, target_f = x1_hat.float(), target.float()
                 with torch.no_grad():
-                    med = torch.median(weighted_sqdist(x1_hat, target, w)).clamp_min(1e-6)
+                    med = torch.median(weighted_sqdist(x1_hat_f, target_f, w)).clamp_min(1e-6)
                     eps = (eps_scale * med).clamp_min(1e-3)
-                endpoint_loss = sinkhorn_divergence(x1_hat, target, eps, n_iters, w=w)
+                endpoint_loss = sinkhorn_divergence(x1_hat_f, target_f, eps, n_iters, w=w)
+                global _SINKHORN_NONFINITE_COUNT
                 if not torch.isfinite(endpoint_loss):
+                    _SINKHORN_NONFINITE_COUNT += 1
+                    if accelerator.is_main_process:
+                        print(f"[sinkhorn] non-finite endpoint_loss, consecutive occurrence "
+                              f"{_SINKHORN_NONFINITE_COUNT}")
+                    limit = getattr(config, 'sinkhorn_nonfinite_limit', 20)
+                    if _SINKHORN_NONFINITE_COUNT > limit:
+                        raise RuntimeError(
+                            f"sinkhorn endpoint_loss non-finite {_SINKHORN_NONFINITE_COUNT} "
+                            f"consecutive times, exceeding limit {limit}."
+                        )
                     endpoint_loss = torch.zeros((), device=device)
+                else:
+                    _SINKHORN_NONFINITE_COUNT = 0
             else:
                 raise ValueError(f"Unknown endpoint_loss: {endpoint_type}")
 
-            loss = loss + endpoint_loss * config.gamma
+            warmup_steps = max(int(getattr(config, 'gamma_warmup_steps', 15000)), 1)
+            gamma_t = config.gamma * min(1.0, float(iteration) / warmup_steps)
+            loss = loss + endpoint_loss * gamma_t
 
     elif mode == "predict_p":
         t_p = torch.ones(B, device=device)
@@ -250,7 +272,6 @@ def train_step(source, target, perturbation_id, vf, accelerator,
         'target_coverage': target_coverage,
     }
     return loss, sampling_stats
-
 
 def wrapped_vf(target, t, source, perturbation_id, vf, gene_ids, gene_all, perturbation_emb=None):
     gene = gene_ids.repeat(source.shape[0], 1).to(device)
@@ -458,7 +479,7 @@ if __name__ == "__main__":
 
     gene_ids = vocab.encode(list(data_manager.adata.var_names))
     gene_ids = torch.tensor(gene_ids, dtype=torch.long, device=device)
-
+    
     grn_mask_path_arg = None
     if getattr(config, 'grn_mask_path', '') != '':
         grn_cache = mask_path.replace('.pt', '_grn.pt')
@@ -498,6 +519,7 @@ if __name__ == "__main__":
         fusion_method=config.fusion_method,
         perturbation_function=config.perturbation_function,
         control_token_id=vocab.stoi.get('control'),
+        neighbor_gate=config.neighbor_gate,
         mask_path=mask_path,
         wire_path=model_wire_path,
         use_wire=config.use_wire,
@@ -506,14 +528,15 @@ if __name__ == "__main__":
         corr_path=corr_path_arg,
     )
 
-    gene_column_by_token = build_gene_column_lookup(gene_ids, len(vocab)).to(device)
+    gene_column_by_token = build_gene_column_lookup(gene_ids, len(vocab))
     sampling_neighbor_columns = build_neighbor_column_table(
         mask_path=mask_path,
         gene_token_ids=gene_ids,
         vocab_size=len(vocab),
         topk=config.topk,
         corr_path=corr_path_arg,
-    ).to(device)
+    )
+
     if accelerator.is_main_process:
         log_source_fingerprint('model', type(vf))
         print(
@@ -586,7 +609,7 @@ if __name__ == "__main__":
             set_requires_grad_for_p_only(vf, p_only=config.mode)
 
             loss, sampling_stats = train_step(
-                source, target, perturbation_id, vf, accelerator,
+                source, target, perturbation_id, vf, accelerator, iteration=iteration,
                 noise_type=config.noise_type, mode=config.mode, cfg_dropout=0.0,
                 deg_weights=deg_weights, condition_idx=condition_idx_raw,
                 gene_column_by_token=gene_column_by_token,

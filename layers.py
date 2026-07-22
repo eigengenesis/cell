@@ -40,19 +40,6 @@ class ExprDecoder(nn.Module):
 
 
 class GeneEncoder(nn.Module):
-    """
-    Gene embedding plus a fixed co-expression graph (neighbor table + manifold
-    coordinates) built once from mask_path / wire_path / grn_mask_path. The
-    graph is stored over the full vocabulary; local_graph() remaps it into
-    whatever gene subset a given forward call is using, so it works under
-    per-step gene subsampling without needing the graph rebuilt.
-
-    mask_path stores a boolean adjacency (True = NON-neighbor, as inverted
-    upstream) with no edge sign or strength, so edge_weight here is 1.0 for a
-    real neighbor and 0.0 otherwise. The neg_msg channel in VoidGeneBlock is
-    therefore always zero until a signed correlation cache is supplied instead
-    of the boolean mask.
-    """
     def __init__(
         self,
         num_embeddings: int,
@@ -140,10 +127,6 @@ class GeneEncoder(nn.Module):
         return merged
 
     def local_graph(self, gene_id_row: Tensor):
-        """Remap the full-vocab neighbor table into the local index space of the
-        current (possibly subsampled/permuted) gene_id_row. Returns
-        (local_neighbor_idx, local_edge_weight_pos, local_edge_weight_neg), each
-        shaped (G, neighbor_cap)."""
         device = gene_id_row.device
         g = gene_id_row.numel()
         pos_table = torch.full((self.embedding.num_embeddings,), -1, dtype=torch.long, device=device)

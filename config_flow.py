@@ -8,9 +8,6 @@ class FlowConfig:
     batch_size: int = 32
     ntoken: int = 512
     d_model: int = 512
-    d_hid: int = 2048
-    encode_blocks: int = 4
-    think_steps: int = 8
     lr: float = 1e-5
     steps: int = 5000 # iterations
     eta_min: float = 1e-7
@@ -25,7 +22,6 @@ class FlowConfig:
     print_every: int = 5000
     mode: str = 'predict_y'  # predict_y, predict_p
     result_path: str = './result'
-    run_tag: str = 'void'
     perturbation_fusion_method: str = 'sum'  # mlp, sum
     fusion_method: str = 'cross'  # cross , concat, add
     infer_top_gene: int = 1000
@@ -50,6 +46,10 @@ class FlowConfig:
     # Empty string disables the second graph pass.
     grn_mask_path: str = ''
     use_signed_edges: bool = False
+    neighbor_gate: bool = False
+    d_hid: int = 2048
+    encode_blocks: int = 8
+    think_steps: int = 8
     def __post_init__(self):
         if self.data_name == 'norman_umi_go_filtered':
             self.n_top_genes = 5054
@@ -76,6 +76,5 @@ class FlowConfig:
                              f'repo_{self.use_repo}',
                              f'endpoint_{self.endpoint_loss}',
                              f'grn_{self.grn_mask_path != ""}',
-                             f'tag_{self.run_tag}',
                              ])
         return os.path.join(self.result_path, exp_name)
