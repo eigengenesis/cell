@@ -43,7 +43,7 @@ _SINKHORN_NONFINITE_COUNT = 0
 class RunConfig(Config):
     """Local optimizer controls without requiring changes to scDFM's config."""
 
-    optimizer: Literal["adam", "muon", "normuon_tall", "aurora"] = "adam"
+    optimizer: Literal["adam", "muon", "normuon_tall", "aurora", "soap"] = "adam"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_eps: float = 1e-8
@@ -60,6 +60,15 @@ class RunConfig(Config):
     aurora_pp_iterations: int = 2
     aurora_pp_beta: float = 0.5
     aurora_nesterov: bool = True
+    soap_lr: float = 5e-5
+    soap_beta1: float = 0.9
+    soap_beta2: float = 0.95
+    soap_shampoo_beta: float = 0.95
+    soap_eps: float = 1e-8
+    soap_weight_decay: float = 0.1
+    soap_block_size: int = 256
+    soap_power_iter_steps: int = 1
+    soap_max_update_rms: float = 0.0
     orthogonal_weight_decay: float = 0.025
 
     def make_path(self):
@@ -70,8 +79,10 @@ class RunConfig(Config):
             detail = f"lr_{self.muon_lr:g}-ns_{self.muon_ns_steps}"
         elif self.optimizer == "normuon_tall":
             detail = f"lr_{self.normuon_lr:g}-beta2_{self.normuon_beta2:g}"
-        else:
+        elif self.optimizer == "aurora":
             detail = f"lr_{self.aurora_lr:g}-pp_{self.aurora_pp_iterations}"
+        else:
+            detail = f"lr_{self.soap_lr:g}-block_{self.soap_block_size}-kl"
         return f"{base}-optimizer_{self.optimizer}-{detail}"
 
 def log_source_fingerprint(label, obj):
@@ -485,6 +496,52 @@ def aurora_polar(g: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     return x
 
 
+def soap_eigh_descending(matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric eigendecomposition with the stable ordering used by KL-SOAP."""
+    original_dtype = matrix.dtype
+    try:
+        eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+    except (torch.linalg.LinAlgError, RuntimeError):
+        eigenvalues, eigenvectors = torch.linalg.eigh(matrix.double())
+    return (
+        eigenvalues.to(original_dtype).flip(0),
+        eigenvectors.to(original_dtype).flip(1),
+    )
+
+
+def soap_project_in(
+    tensor: torch.Tensor,
+    left_basis: torch.Tensor,
+    right_basis: torch.Tensor,
+) -> torch.Tensor:
+    tensor = torch.tensordot(tensor, left_basis, dims=[[0], [0]])
+    return torch.tensordot(tensor, right_basis, dims=[[0], [0]])
+
+
+def soap_project_out(
+    tensor: torch.Tensor,
+    left_basis: torch.Tensor,
+    right_basis: torch.Tensor,
+) -> torch.Tensor:
+    tensor = torch.tensordot(tensor, left_basis, dims=[[0], [1]])
+    return torch.tensordot(tensor, right_basis, dims=[[0], [1]])
+
+
+def soap_rayleigh_values(matrix: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+    return torch.diagonal(basis.T @ matrix @ basis)
+
+
+def soap_refine_basis(
+    matrix: torch.Tensor,
+    basis: torch.Tensor,
+    power_iter_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    refined = basis
+    for _ in range(max(int(power_iter_steps), 1)):
+        refined = torch.linalg.qr(matrix @ refined).Q
+    return soap_rayleigh_values(matrix, refined), refined
+
+
 def use_orthogonal_optimizer(name: str, param: torch.nn.Parameter) -> bool:
     """Keep embeddings, normalization, and prediction heads on AdamW."""
     if param.ndim != 2:
@@ -502,7 +559,7 @@ def use_orthogonal_optimizer(name: str, param: torch.nn.Parameter) -> bool:
 
 
 class HybridOrthogonalAdamW(torch.optim.Optimizer):
-    """Muon/Aurora for hidden matrices and AdamW for remaining parameters."""
+    """Matrix optimizer for hidden weights and AdamW for remaining parameters."""
 
     def __init__(self, param_groups):
         super().__init__(param_groups, {})
@@ -521,6 +578,8 @@ class HybridOrthogonalAdamW(torch.optim.Optimizer):
                 self._normuon_tall_step(group)
             elif algorithm == "aurora":
                 self._orthogonal_step(group, use_aurora=True)
+            elif algorithm == "soap":
+                self._soap_step(group)
             elif algorithm == "adamw":
                 self._adamw_step(group)
             else:
@@ -620,6 +679,170 @@ class HybridOrthogonalAdamW(torch.optim.Optimizer):
                 p.mul_(1.0 - lr * weight_decay)
             p.sub_(update)
 
+    @staticmethod
+    def _init_soap_blocks(param, block_size):
+        blocks = []
+        rows, cols = param.shape
+        for row_start in range(0, rows, block_size):
+            row_end = min(row_start + block_size, rows)
+            for col_start in range(0, cols, block_size):
+                col_end = min(col_start + block_size, cols)
+                block_rows = row_end - row_start
+                block_cols = col_end - col_start
+                device = param.device
+                blocks.append(
+                    {
+                        "bounds": (row_start, row_end, col_start, col_end),
+                        "exp_avg": torch.zeros(
+                            block_rows, block_cols, device=device, dtype=torch.float32
+                        ),
+                        "exp_avg_sq": torch.zeros(
+                            block_rows, block_cols, device=device, dtype=torch.float32
+                        ),
+                        "left": torch.zeros(
+                            block_rows, block_rows, device=device, dtype=torch.float32
+                        ),
+                        "right": torch.zeros(
+                            block_cols, block_cols, device=device, dtype=torch.float32
+                        ),
+                        "left_basis": torch.eye(block_rows, device=device, dtype=torch.float32),
+                        "right_basis": torch.eye(block_cols, device=device, dtype=torch.float32),
+                        "left_values": torch.zeros(
+                            block_rows, device=device, dtype=torch.float32
+                        ),
+                        "right_values": torch.zeros(
+                            block_cols, device=device, dtype=torch.float32
+                        ),
+                    }
+                )
+        return blocks
+
+    @torch.no_grad()
+    def _soap_step(self, group):
+        """Blocked, real-time KL-SOAP following NVIDIA Emerging-Optimizers."""
+        lr = group["lr"]
+        beta1, beta2 = group["betas"]
+        shampoo_beta = group["shampoo_beta"]
+        eps = group["eps"]
+        weight_decay = group["weight_decay"]
+        block_size = max(int(group["block_size"]), 1)
+        power_iter_steps = max(int(group["power_iter_steps"]), 1)
+        max_update_rms = float(group["max_update_rms"])
+
+        previous_precision = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("highest")
+        try:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                if p.grad.is_sparse:
+                    raise RuntimeError("SOAP does not support sparse gradients.")
+                if p.ndim != 2:
+                    raise RuntimeError(f"SOAP expects a matrix, got shape {tuple(p.shape)}")
+
+                state = self.state[p]
+                if not state:
+                    state["step"] = 0
+                    state["blocks"] = self._init_soap_blocks(p, block_size)
+                iteration = int(state["step"]) + 1
+                corrected_shampoo_beta = 1.0 - (
+                    (1.0 - shampoo_beta) / (1.0 - shampoo_beta ** iteration)
+                )
+
+                if weight_decay:
+                    p.mul_(1.0 - lr * weight_decay)
+
+                for block in state["blocks"]:
+                    row_start, row_end, col_start, col_end = block["bounds"]
+                    grad = p.grad[row_start:row_end, col_start:col_end].float()
+                    left = block["left"]
+                    right = block["right"]
+                    left_basis = block["left_basis"]
+                    right_basis = block["right_basis"]
+
+                    left_scale = (
+                        block["left_values"].clamp_min(eps).reciprocal()
+                        / float(grad.shape[0])
+                    )
+                    right_scale = (
+                        block["right_values"].clamp_min(eps).reciprocal()
+                        / float(grad.shape[1])
+                    )
+                    left_correction = (
+                        left_basis * left_scale.unsqueeze(0)
+                    ) @ left_basis.T
+                    right_correction = (
+                        right_basis * right_scale.unsqueeze(0)
+                    ) @ right_basis.T
+                    left.lerp_(
+                        grad @ right_correction @ grad.T,
+                        1.0 - corrected_shampoo_beta,
+                    )
+                    right.lerp_(
+                        grad.T @ left_correction @ grad,
+                        1.0 - corrected_shampoo_beta,
+                    )
+
+                    exp_avg = soap_project_out(
+                        block["exp_avg"], left_basis, right_basis
+                    )
+                    exp_avg_sq = block["exp_avg_sq"]
+                    if state["step"] == 0:
+                        left_values, left_basis = soap_eigh_descending(left)
+                        right_values, right_basis = soap_eigh_descending(right)
+                    else:
+                        left_order = torch.argsort(
+                            soap_rayleigh_values(left, left_basis), descending=True
+                        )
+                        right_order = torch.argsort(
+                            soap_rayleigh_values(right, right_basis), descending=True
+                        )
+                        left_basis = left_basis[:, left_order]
+                        right_basis = right_basis[:, right_order]
+                        exp_avg_sq = exp_avg_sq.index_select(
+                            0, left_order
+                        ).index_select(1, right_order)
+                        left_values, left_basis = soap_refine_basis(
+                            left, left_basis, power_iter_steps
+                        )
+                        right_values, right_basis = soap_refine_basis(
+                            right, right_basis, power_iter_steps
+                        )
+
+                    exp_avg = soap_project_in(exp_avg, left_basis, right_basis)
+                    block["left_basis"] = left_basis
+                    block["right_basis"] = right_basis
+                    block["left_values"] = left_values
+                    block["right_values"] = right_values
+                    block["exp_avg"] = exp_avg
+                    block["exp_avg_sq"] = exp_avg_sq
+
+                    projected_grad = soap_project_in(grad, left_basis, right_basis)
+                    exp_avg.lerp_(projected_grad, 1.0 - beta1)
+                    exp_avg_sq.lerp_(projected_grad.square(), 1.0 - beta2)
+                    first_moment = exp_avg / (1.0 - beta1 ** iteration)
+                    second_moment = exp_avg_sq / (1.0 - beta2 ** iteration)
+                    update = first_moment / (second_moment.sqrt() + eps)
+                    update = soap_project_out(update, left_basis, right_basis)
+
+                    if max_update_rms > 0.0:
+                        update_rms = update.square().mean().sqrt()
+                        update.mul_(
+                            (max_update_rms / (update_rms + 1e-7)).clamp(max=1.0)
+                        )
+                    if not torch.isfinite(update).all():
+                        raise RuntimeError(
+                            f"SOAP produced a non-finite update for {tuple(p.shape)} "
+                            f"at block {(row_start, row_end, col_start, col_end)}"
+                        )
+                    p[row_start:row_end, col_start:col_end].add_(
+                        update.to(p.dtype), alpha=-lr
+                    )
+
+                state["step"] = iteration
+        finally:
+            torch.set_float32_matmul_precision(previous_precision)
+
     def _adamw_step(self, group):
         lr = group["lr"]
         beta1, beta2 = group["betas"]
@@ -665,6 +888,35 @@ def build_optimizer(model: nn.Module, cfg: RunConfig):
             continue
         destination = orthogonal_params if use_orthogonal_optimizer(name, param) else adamw_params
         destination.append(param)
+
+    if cfg.optimizer == "soap":
+        if cfg.soap_block_size < 1:
+            raise ValueError(f"soap_block_size must be positive, got {cfg.soap_block_size}")
+        groups = [
+            {
+                "params": orthogonal_params,
+                "algorithm": "soap",
+                "name": "soap",
+                "lr": cfg.soap_lr,
+                "betas": (cfg.soap_beta1, cfg.soap_beta2),
+                "shampoo_beta": cfg.soap_shampoo_beta,
+                "eps": cfg.soap_eps,
+                "weight_decay": cfg.soap_weight_decay,
+                "block_size": cfg.soap_block_size,
+                "power_iter_steps": cfg.soap_power_iter_steps,
+                "max_update_rms": cfg.soap_max_update_rms,
+            },
+            {
+                "params": adamw_params,
+                "algorithm": "adamw",
+                "name": "adamw",
+                "lr": cfg.lr,
+                "betas": (cfg.adam_beta1, cfg.adam_beta2),
+                "eps": cfg.adam_eps,
+                "weight_decay": cfg.soap_weight_decay,
+            },
+        ]
+        return HybridOrthogonalAdamW([group for group in groups if group["params"]])
 
     if cfg.optimizer == "muon":
         orthogonal_lr = cfg.muon_lr
@@ -726,7 +978,31 @@ def optimizer_summary(optimizer) -> str:
     for index, group in enumerate(optimizer.param_groups):
         count = sum(param.numel() for param in group["params"])
         name = group.get("name", f"group{index}")
-        details.append(f"{name}:params={count},lr={group['lr']:.3g}")
+        detail = f"{name}:params={count},lr={group['lr']:.3g}"
+        if group.get("algorithm") == "soap":
+            block_size = int(group["block_size"])
+            block_count = 0
+            state_elements = 0
+            for param in group["params"]:
+                rows, cols = param.shape
+                for row_start in range(0, rows, block_size):
+                    block_rows = min(block_size, rows - row_start)
+                    for col_start in range(0, cols, block_size):
+                        block_cols = min(block_size, cols - col_start)
+                        block_count += 1
+                        state_elements += (
+                            2 * block_rows * block_cols
+                            + 2 * block_rows * block_rows
+                            + 2 * block_cols * block_cols
+                            + block_rows
+                            + block_cols
+                        )
+            state_gib = state_elements * 4 / (1024 ** 3)
+            detail += (
+                f",blocks={block_count},block_size={block_size},"
+                f"state_est_gib={state_gib:.2f}"
+            )
+        details.append(detail)
     return " | ".join(details)
 
 if __name__ == "__main__":
